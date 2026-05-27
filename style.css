@@ -1,0 +1,126 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  overflow: hidden;
+  font-family: Arial, sans-serif;
+  background: radial-gradient(circle at center, #111, #050505);
+  color: white;
+}
+
+canvas {
+  display: block;
+}
+
+/* HUD */
+
+#hud {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  z-index: 5;
+}
+
+.playerBox {
+  background: rgba(0,0,0,0.55);
+  padding: 14px 20px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.15);
+  box-shadow: 0 0 20px rgba(0,255,120,0.15);
+  margin-bottom: 15px;
+  backdrop-filter: blur(10px);
+}
+
+#turnText {
+  font-size: 22px;
+  font-weight: bold;
+}
+
+#ballTypeText {
+  margin-top: 5px;
+  color: #9cffd1;
+}
+
+.powerContainer {
+  width: 240px;
+  height: 20px;
+  border-radius: 20px;
+  overflow: hidden;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.2);
+}
+
+#powerBar {
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, #00ff95, #00d9ff);
+  transition: width 0.05s;
+}
+
+/* OVERLAY */
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  justify-content: center;
+  align-items: center;
+  z-index: 20;
+  background: rgba(0,0,0,0.65);
+  backdrop-filter: blur(8px);
+}
+
+.overlay.active {
+  display: flex;
+}
+
+.menu {
+  width: 420px;
+  padding: 35px;
+  border-radius: 24px;
+  background: rgba(15,15,15,0.9);
+  border: 1px solid rgba(255,255,255,0.15);
+  text-align: center;
+  box-shadow:
+    0 0 40px rgba(0,255,120,0.12),
+    0 0 120px rgba(0,0,0,0.6);
+}
+
+.menu h1 {
+  font-size: 42px;
+  margin-bottom: 15px;
+  color: #00ff95;
+}
+
+.menu p {
+  opacity: 0.85;
+  margin-bottom: 20px;
+}
+
+.menu button {
+  width: 100%;
+  padding: 14px;
+  margin-top: 14px;
+  border: none;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #00ff95, #00d0ff);
+  color: black;
+  font-weight: bold;
+  font-size: 16px;
+  cursor: pointer;
+  transition: 0.25s;
+}
+
+.menu button:hover {
+  transform: scale(1.03);
+}
+
+.controls {
+  margin-top: 25px;
+  text-align: left;
+  line-height: 1.8;
+  opacity: 0.85;
+}

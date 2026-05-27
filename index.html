@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>3D 8-Ball Pool</title>
+
+  <link rel="stylesheet" href="style.css" />
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+</head>
+<body>
+
+  <!-- START SCREEN -->
+  <div id="startScreen" class="overlay active">
+    <div class="menu">
+      <h1>🎱 3D 8-Ball Pool</h1>
+      <p>Arcade-realistic billiards with modern visuals.</p>
+
+      <button id="startBtn">START GAME</button>
+      <button id="soundBtn">🔊 SOUND: ON</button>
+
+      <div class="controls">
+        <h3>Controls</h3>
+        <p>Click + Drag to aim and shoot</p>
+        <p>Release mouse to strike cue ball</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- UI -->
+  <div id="hud">
+    <div class="playerBox">
+      <div id="turnText">Player 1 Turn</div>
+      <div id="ballTypeText">Open Table</div>
+    </div>
+
+    <div class="powerContainer">
+      <div id="powerBar"></div>
+    </div>
+  </div>
+
+  <!-- GAME OVER -->
+  <div id="gameOver" class="overlay">
+    <div class="menu">
+      <h1 id="winnerText">Player Wins!</h1>
+      <button onclick="location.reload()">PLAY AGAIN</button>
+    </div>
+  </div>
+
+  <canvas id="gameCanvas"></canvas>
+
+  <script src="script.js"></script>
+</body>
+</html>
