@@ -2,53 +2,113 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>3D 8-Ball Pool</title>
-
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>8-Ball Pool</title>
   <link rel="stylesheet" href="style.css" />
-
-  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet" />
 </head>
 <body>
 
-  <!-- START SCREEN -->
-  <div id="startScreen" class="overlay active">
-    <div class="menu">
-      <h1>🎱 3D 8-Ball Pool</h1>
-      <p>Arcade-realistic billiards with modern visuals.</p>
-
-      <button id="startBtn">START GAME</button>
-      <button id="soundBtn">🔊 SOUND: ON</button>
-
-      <div class="controls">
-        <h3>Controls</h3>
-        <p>Click + Drag to aim and shoot</p>
-        <p>Release mouse to strike cue ball</p>
+  <!-- ═══════════════════════════════════════════════════════
+       START SCREEN OVERLAY
+  ═══════════════════════════════════════════════════════ -->
+  <div id="startScreen" class="screen active">
+    <div class="screen-bg"></div>
+    <div class="screen-content">
+      <div class="logo-wrap">
+        <div class="logo-ball">8</div>
+        <h1 class="logo-title">BILLIARDS</h1>
+        <p class="logo-sub">CHAMPIONSHIP POOL</p>
+      </div>
+      <div class="menu-buttons">
+        <button class="btn btn-primary" id="startBtn">START GAME</button>
+        <button class="btn btn-secondary" id="howToBtn">HOW TO PLAY</button>
+      </div>
+      <div class="sound-row">
+        <button class="sound-toggle" id="soundToggleStart">
+          <span class="sound-icon">🔊</span>
+          <span class="sound-label">SOUND ON</span>
+        </button>
+      </div>
+      <div class="howto-panel" id="howtoPanel">
+        <h3>HOW TO PLAY</h3>
+        <ul>
+          <li>🎱 Click &amp; drag the cue stick to aim</li>
+          <li>💪 Drag further back for more power</li>
+          <li>⬆️ Release to shoot</li>
+          <li>🟡 Player 1 gets stripes or solids on first pot</li>
+          <li>🎯 Pot all your balls then sink the 8-ball to win</li>
+          <li>⚠️ Scratching or potting 8-ball early = lose</li>
+        </ul>
       </div>
     </div>
   </div>
 
-  <!-- UI -->
-  <div id="hud">
-    <div class="playerBox">
-      <div id="turnText">Player 1 Turn</div>
-      <div id="ballTypeText">Open Table</div>
-    </div>
-
-    <div class="powerContainer">
-      <div id="powerBar"></div>
+  <!-- ═══════════════════════════════════════════════════════
+       GAME OVER SCREEN
+  ═══════════════════════════════════════════════════════ -->
+  <div id="gameOverScreen" class="screen">
+    <div class="screen-bg"></div>
+    <div class="screen-content">
+      <div class="winner-wrap">
+        <div class="winner-trophy">🏆</div>
+        <h2 class="winner-title" id="winnerTitle">PLAYER 1 WINS!</h2>
+        <p class="winner-reason" id="winnerReason">Potted the 8-ball!</p>
+      </div>
+      <div class="final-scores" id="finalScores"></div>
+      <div class="menu-buttons">
+        <button class="btn btn-primary" id="playAgainBtn">PLAY AGAIN</button>
+        <button class="btn btn-secondary" id="mainMenuBtn">MAIN MENU</button>
+      </div>
     </div>
   </div>
 
-  <!-- GAME OVER -->
-  <div id="gameOver" class="overlay">
-    <div class="menu">
-      <h1 id="winnerText">Player Wins!</h1>
-      <button onclick="location.reload()">PLAY AGAIN</button>
+  <!-- ═══════════════════════════════════════════════════════
+       MAIN GAME UI
+  ═══════════════════════════════════════════════════════ -->
+  <div id="gameUI" class="game-ui hidden">
+
+    <!-- Top HUD -->
+    <div class="hud-top">
+      <div class="player-panel" id="p1Panel">
+        <div class="player-name">PLAYER 1</div>
+        <div class="player-type" id="p1Type">—</div>
+        <div class="ball-rack" id="p1Rack"></div>
+        <div class="player-score" id="p1Score">0</div>
+      </div>
+
+      <div class="hud-center">
+        <div class="turn-indicator" id="turnIndicator">PLAYER 1'S TURN</div>
+        <div class="foul-msg" id="foulMsg"></div>
+        <button class="sound-toggle small" id="soundToggleGame">🔊</button>
+      </div>
+
+      <div class="player-panel right" id="p2Panel">
+        <div class="player-name">PLAYER 2</div>
+        <div class="player-type" id="p2Type">—</div>
+        <div class="ball-rack" id="p2Rack"></div>
+        <div class="player-score" id="p2Score">0</div>
+      </div>
     </div>
+
+    <!-- Power meter -->
+    <div class="power-wrap" id="powerWrap">
+      <div class="power-label">POWER</div>
+      <div class="power-bar-outer">
+        <div class="power-bar-fill" id="powerFill"></div>
+      </div>
+    </div>
+
+    <!-- Shoot instruction -->
+    <div class="shoot-hint" id="shootHint">Click &amp; drag to aim — release to shoot</div>
+
   </div>
 
-  <canvas id="gameCanvas"></canvas>
+  <!-- ═══════════════════════════════════════════════════════
+       CANVAS
+  ═══════════════════════════════════════════════════════ -->
+  <canvas id="poolCanvas"></canvas>
 
   <script src="script.js"></script>
 </body>
