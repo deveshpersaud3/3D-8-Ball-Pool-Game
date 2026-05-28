@@ -357,54 +357,65 @@ const Physics = (() => {
     let anyMoving = false;
     const pocketedNow = [];
 
-    // Move each ball
-    balls.forEach(ball => {
-      if (ball.pocketed) return;
-      if (Math.abs(ball.vx) < CFG.MIN_SPEED && Math.abs(ball.vy) < CFG.MIN_SPEED) {
-        ball.vx = 0; ball.vy = 0;
-        return;
-      }
-      anyMoving = true;
+    // Split into sub-steps so fast-moving balls don't tunnel through others.
+    const maxSpeed = balls.reduce((max, ball) => {
+      if (ball.pocketed) return max;
+      return Math.max(max, Math.hypot(ball.vx, ball.vy));
+    }, 0);
+    const maxDist = maxSpeed * dt;
+    const substeps = Math.min(5, Math.max(1, Math.ceil(maxDist / (CFG.BALL_R * 0.75))));
+    const subdt = dt / substeps;
 
-      ball.x += ball.vx * dt;
-      ball.y += ball.vy * dt;
-      ball.spin += (ball.vx * 0.01); // visual spin
-
-      // Friction
-      ball.vx *= CFG.FRICTION;
-      ball.vy *= CFG.FRICTION;
-    });
-
-    // Ball-wall collisions
-    balls.forEach(ball => {
-      if (ball.pocketed) return;
-      wallCollide(ball);
-    });
-
-    // Ball-ball collisions (n² for simplicity — 15 balls is fine)
-    for (let i = 0; i < balls.length; i++) {
-      for (let j = i + 1; j < balls.length; j++) {
-        if (balls[i].pocketed || balls[j].pocketed) continue;
-        ballCollide(balls[i], balls[j]);
-      }
-    }
-
-    // Pocket detection
-    balls.forEach(ball => {
-      if (ball.pocketed) return;
-      POCKETS.forEach(p => {
-        const dx = ball.x - p.x;
-        const dy = ball.y - p.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < CFG.POCKET_R + CFG.BALL_R * 0.5) {
-          ball.pocketed = true;
+    for (let stepIndex = 0; stepIndex < substeps; stepIndex++) {
+      // Move each ball for this sub-step
+      balls.forEach(ball => {
+        if (ball.pocketed) return;
+        if (Math.abs(ball.vx) < CFG.MIN_SPEED && Math.abs(ball.vy) < CFG.MIN_SPEED) {
           ball.vx = 0; ball.vy = 0;
-          pocketedNow.push({ ball, pocket: p });
-          Audio.pocket();
-          State.pocketFlash.push({ x: p.x, y: p.y, t: 1.0 });
+          return;
         }
+        anyMoving = true;
+
+        ball.x += ball.vx * subdt;
+        ball.y += ball.vy * subdt;
+        ball.spin += (ball.vx * 0.01); // visual spin
+
+        // Friction
+        ball.vx *= Math.pow(CFG.FRICTION, subdt);
+        ball.vy *= Math.pow(CFG.FRICTION, subdt);
       });
-    });
+
+      // Ball-wall collisions
+      balls.forEach(ball => {
+        if (ball.pocketed) return;
+        wallCollide(ball);
+      });
+
+      // Ball-ball collisions (n² for simplicity — 15 balls is fine)
+      for (let i = 0; i < balls.length; i++) {
+        for (let j = i + 1; j < balls.length; j++) {
+          if (balls[i].pocketed || balls[j].pocketed) continue;
+          ballCollide(balls[i], balls[j]);
+        }
+      }
+
+      // Pocket detection
+      balls.forEach(ball => {
+        if (ball.pocketed) return;
+        POCKETS.forEach(p => {
+          const dx = ball.x - p.x;
+          const dy = ball.y - p.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < CFG.POCKET_R + CFG.BALL_R * 0.5) {
+            ball.pocketed = true;
+            ball.vx = 0; ball.vy = 0;
+            pocketedNow.push({ ball, pocket: p });
+            Audio.pocket();
+            State.pocketFlash.push({ x: p.x, y: p.y, t: 1.0 });
+          }
+        });
+      });
+    }
 
     return { anyMoving, pocketedNow };
   }
