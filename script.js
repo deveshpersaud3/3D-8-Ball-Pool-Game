@@ -112,6 +112,7 @@ const State = {
   // AI
   aiThinking: false,
   aiTimer: null,
+  aiDifficulty: 'medium',
 
   // Which balls were pocketed this turn
   pocketedThisTurn: [],
@@ -1245,8 +1246,8 @@ const Rules = (() => {
     updateHUDBallsDisplay();
     State.pocketedThisTurn = [];
 
-    // Trigger AI if it's now AI's turn
-    if (State.vsAI && State.currentPlayer === 1 && !State.awaitingCueBall) {
+    // Trigger AI if it's now AI's turn (AI will handle ball-in-hand placement itself)
+    if (State.vsAI && State.currentPlayer === 1) {
       scheduleAIShot();
     }
   }
@@ -1303,34 +1304,97 @@ const AI = (() => {
 
   /** AI places the cue ball at a reasonable spot when it has ball-in-hand */
   function placeAICueBall() {
-    // Try a few candidate positions and pick one that's valid and near a target
-    const candidates = [
-      { x: FIELD.x + FIELD.w * 0.22, y: FIELD.y + FIELD.h * 0.5 },
-      { x: FIELD.x + FIELD.w * 0.22, y: FIELD.y + FIELD.h * 0.3 },
-      { x: FIELD.x + FIELD.w * 0.22, y: FIELD.y + FIELD.h * 0.7 },
-      { x: FIELD.x + FIELD.w * 0.3,  y: FIELD.y + FIELD.h * 0.5 },
-    ];
-    for (const c of candidates) {
-      if (isValidCuePlacement(c.x, c.y)) {
-        const cue = State.balls.find(b => b.id === 0);
-        if (cue) { cue.x = c.x; cue.y = c.y; cue.pocketed = false; cue.vx = 0; cue.vy = 0; }
-        State.awaitingCueBall = false;
-        State.ballInHandFull  = false;
-        return;
+    // Smarter placement: compute approach-line positions for possible target balls
+    const aiType = State.playerTypes[1];
+    let targets = [];
+    if (!State.typesAssigned) {
+      targets = State.balls.filter(b => !b.pocketed && b.id !== 0 && b.id !== 8);
+    } else if (aiType === 'solid') {
+      targets = State.balls.filter(b => !b.pocketed && b.id >= 1 && b.id <= 7);
+    } else {
+      targets = State.balls.filter(b => !b.pocketed && b.id >= 9 && b.id <= 15);
+    }
+
+    // If no targets, allow cue placement near head area
+    if (targets.length === 0) {
+      for (let tries = 0; tries < 100; tries++) {
+        const x = FIELD.x + 20 + Math.random() * (FIELD.w - 40);
+        const y = FIELD.y + 20 + Math.random() * (FIELD.h - 40);
+        if (isValidCuePlacement(x, y)) {
+          const cue = State.balls.find(b => b.id === 0);
+          if (cue) { cue.x = x; cue.y = y; cue.pocketed = false; cue.vx = 0; cue.vy = 0; }
+          State.awaitingCueBall = false; State.ballInHandFull = false; return;
+        }
       }
     }
-    // Fallback: find any valid position
-    for (let tries = 0; tries < 50; tries++) {
+
+    const POCKETS = Physics.POCKETS;
+    const candidates = [];
+
+    targets.forEach(ball => {
+      POCKETS.forEach(pocket => {
+        // approach vector from ball to pocket
+        const vx = pocket.x - ball.x;
+        const vy = pocket.y - ball.y;
+        const vlen = Math.hypot(vx, vy);
+        if (vlen < 1) return;
+        const ux = vx / vlen, uy = vy / vlen;
+        // desired cue position slightly behind the object ball along approach line
+        const gap = CFG.BALL_R * 2 + 6;
+        const cx = ball.x - ux * gap;
+        const cy = ball.y - uy * gap;
+        if (!isValidCuePlacement(cx, cy)) return;
+
+        // Quick obstruction check: ensure line from cue pos to ball centre isn't blocked
+        let blocked = false;
+        State.balls.forEach(ob => {
+          if (ob.pocketed || ob.id === 0 || ob.id === ball.id) return;
+          const d = pointToSegmentDistance(ob.x, ob.y, cx, cy, ball.x, ball.y);
+          if (d < CFG.BALL_R * 1.9) blocked = true;
+        });
+        if (blocked) return;
+
+        // Score: distance from head area (prefer near head for easier break-ins) + ball-to-pocket closeness
+        const score = Math.hypot(cx - (FIELD.x + FIELD.w * 0.25), cy - (FIELD.y + FIELD.h / 2)) + (Math.hypot(ball.x - pocket.x, ball.y - pocket.y) * 0.6);
+        candidates.push({ x: cx, y: cy, score });
+      });
+    });
+
+    if (candidates.length > 0) {
+      // Sort by score ascending
+      candidates.sort((a, b) => a.score - b.score);
+      let pick = null;
+      if (State.aiDifficulty === 'hard') pick = candidates[0];
+      else if (State.aiDifficulty === 'medium') pick = candidates[Math.min(2, Math.floor(Math.random() * Math.min(3, candidates.length)))];
+      else pick = candidates[Math.floor(Math.random() * candidates.length)];
+
+      if (pick) {
+        const cue = State.balls.find(b => b.id === 0);
+        if (cue) { cue.x = pick.x; cue.y = pick.y; cue.pocketed = false; cue.vx = 0; cue.vy = 0; }
+        State.awaitingCueBall = false; State.ballInHandFull = false; return;
+      }
+    }
+
+    // Fallback to random valid placement
+    for (let tries = 0; tries < 200; tries++) {
       const x = FIELD.x + 20 + Math.random() * (FIELD.w - 40);
       const y = FIELD.y + 20 + Math.random() * (FIELD.h - 40);
       if (isValidCuePlacement(x, y)) {
         const cue = State.balls.find(b => b.id === 0);
         if (cue) { cue.x = x; cue.y = y; cue.pocketed = false; cue.vx = 0; cue.vy = 0; }
-        State.awaitingCueBall = false;
-        State.ballInHandFull  = false;
-        return;
+        State.awaitingCueBall = false; State.ballInHandFull = false; return;
       }
     }
+  }
+
+  function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
+    const l2 = (x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1);
+    if (l2 === 0) return Math.hypot(px - x1, py - y1);
+    let t = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / l2;
+    t = Math.max(0, Math.min(1, t));
+    const projx = x1 + t * (x2 - x1);
+    const projy = y1 + t * (y2 - y1);
+    return Math.hypot(px - projx, py - projy);
   }
 
   function takeShot() {
@@ -1455,6 +1519,8 @@ const Input = (() => {
 
     // Cue ball placement after scratch
     if (State.awaitingCueBall) {
+      // If it's AI's ball-in-hand, don't let the human place it
+      if (State.vsAI && State.currentPlayer === 1) return;
       placeCueBall(pos.x, pos.y);
       return;
     }
@@ -1729,6 +1795,22 @@ function initGame(vsAI) {
   State.firstContactId = null;
   State.cueHitSomething = false;
   if (State.aiTimer) clearTimeout(State.aiTimer);
+
+  // Set AI difficulty from UI (start screen select)
+  const diffEl = document.getElementById('aiDifficulty');
+  const diff = diffEl ? diffEl.value : 'medium';
+  State.aiDifficulty = diff;
+  // Difficulty presets
+  if (diff === 'easy') {
+    CFG.AI_ACCURACY = 0.80;
+    CFG.AI_THINK_MS = 1400;
+  } else if (diff === 'hard') {
+    CFG.AI_ACCURACY = 0.985;
+    CFG.AI_THINK_MS = 450;
+  } else {
+    CFG.AI_ACCURACY = 0.94;
+    CFG.AI_THINK_MS = 900;
+  }
 
   // Update player 2 name
   document.getElementById('p2Name').textContent = vsAI ? '🤖 AI' : 'Player 2';
