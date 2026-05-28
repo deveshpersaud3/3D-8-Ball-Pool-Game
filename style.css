@@ -359,7 +359,37 @@ html, body {
   perspective: 1200px;
 }
 
+#tableWrap::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, rgba(13,21,16,0.96) 0%, rgba(18,40,26,0.92) 45%, rgba(6,10,8,0.94) 100%),
+    radial-gradient(circle at 30% 20%, rgba(255,220,150,0.08), transparent 18%),
+    radial-gradient(circle at 70% 18%, rgba(255,255,255,0.05), transparent 16%);
+  transform: scale(1.03);
+  filter: blur(12px);
+  pointer-events: none;
+  z-index: 0;
+}
+
+#tableWrap::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.03) 0 2px, transparent 2px 40px),
+    radial-gradient(circle at 20% 18%, rgba(255,206,130,0.14), transparent 12%),
+    radial-gradient(circle at 50% 35%, rgba(255,255,255,0.08), transparent 16%),
+    radial-gradient(circle at 80% 20%, rgba(255,210,130,0.12), transparent 14%);
+  opacity: 0.32;
+  pointer-events: none;
+  z-index: 1;
+}
+
 #poolCanvas {
+  position: relative;
+  z-index: 2;
   display: block;
   border-radius: 4px;
   cursor: crosshair;
