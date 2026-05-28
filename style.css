@@ -366,8 +366,11 @@ html, body {
   background:
     linear-gradient(180deg, rgba(13,21,16,0.96) 0%, rgba(18,40,26,0.92) 45%, rgba(6,10,8,0.94) 100%),
     radial-gradient(circle at 30% 20%, rgba(255,220,150,0.08), transparent 18%),
-    radial-gradient(circle at 70% 18%, rgba(255,255,255,0.05), transparent 16%);
+    radial-gradient(circle at 70% 18%, rgba(255,255,255,0.05), transparent 16%),
+    url('bar-back.jpg');
   transform: scale(1.03);
+  background-size: cover;
+  background-position: center;
   filter: blur(12px);
   pointer-events: none;
   z-index: 0;
