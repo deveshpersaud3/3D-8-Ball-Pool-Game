@@ -879,22 +879,33 @@ const Renderer = (() => {
     c.arc(endX, endY, R, 0, Math.PI * 2);
     c.stroke();
 
-    // If hitting a ball, show deflection line
+    // If hitting a ball, show deflection line and predicted travel path
     if (hitBall) {
       const impAngle = Math.atan2(hitBall.y - endY, hitBall.x - endX);
-      const perpAngle = impAngle + Math.PI / 2;
-      const deflectLen = 60;
-      // Deflected ball path
-      c.globalAlpha = 0.3;
-      c.strokeStyle = '#ff9f43';
-      c.lineWidth = 1;
-      c.setLineDash([4, 6]);
+      const deflectStartX = endX + Math.cos(impAngle) * R;
+      const deflectStartY = endY + Math.sin(impAngle) * R;
+      const deflectLen = 180;
+      const deflectEndX = deflectStartX + Math.cos(impAngle) * deflectLen;
+      const deflectEndY = deflectStartY + Math.sin(impAngle) * deflectLen;
+
+      // Predicted ball path from object ball
+      c.globalAlpha = 0.45;
+      c.strokeStyle = 'rgba(255, 175, 60, 0.95)';
+      c.lineWidth = 2.5;
+      c.setLineDash([8, 6]);
       c.beginPath();
-      c.moveTo(endX + Math.cos(impAngle) * R, endY + Math.sin(impAngle) * R);
-      c.lineTo(
-        endX + Math.cos(impAngle) * (R + deflectLen),
-        endY + Math.sin(impAngle) * (R + deflectLen)
-      );
+      c.moveTo(deflectStartX, deflectStartY);
+      c.lineTo(deflectEndX, deflectEndY);
+      c.stroke();
+
+      // Add a softer highlight line behind it
+      c.globalAlpha = 0.32;
+      c.strokeStyle = 'rgba(255, 215, 110, 0.65)';
+      c.lineWidth = 1.2;
+      c.setLineDash([4, 4]);
+      c.beginPath();
+      c.moveTo(deflectStartX, deflectStartY);
+      c.lineTo(deflectEndX, deflectEndY);
       c.stroke();
 
       // Ghost target ball
@@ -902,11 +913,7 @@ const Renderer = (() => {
       c.setLineDash([]);
       c.fillStyle = BALL_COLORS[hitBall.id];
       c.beginPath();
-      c.arc(
-        endX + Math.cos(impAngle) * R,
-        endY + Math.sin(impAngle) * R,
-        R, 0, Math.PI * 2
-      );
+      c.arc(deflectStartX, deflectStartY, R, 0, Math.PI * 2);
       c.fill();
     }
 
