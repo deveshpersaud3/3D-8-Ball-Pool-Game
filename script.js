@@ -1,1448 +1,1620 @@
-/* ═══════════════════════════════════════════════════════════════════════
-   8-BALL POOL — COMPLETE GAME ENGINE
-   Modules: Audio | Physics | Renderer | Game Logic | UI | Input
-   ═══════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════════
+   MIDNIGHT BILLIARDS — script.js
+   Full 8-Ball Pool Game Engine
+   Modules: Config → State → Audio → Renderer → Physics → AI → Input → UI
+═══════════════════════════════════════════════════════════════════════════ */
 
-'use strict';
+/* ══════════════════════════════════════════════════════════════
+   § 1. CONFIGURATION & CONSTANTS
+══════════════════════════════════════════════════════════════ */
+const CFG = {
+  // Table geometry (canvas units)
+  TABLE_W:      900,
+  TABLE_H:      500,
+  CUSHION:      36,        // cushion/rail width in px
+  POCKET_R:     22,        // pocket hole radius
+  BALL_R:       13,        // ball radius
+  // Physics
+  FRICTION:     0.988,     // per-frame velocity multiplier (rolling friction)
+  MIN_SPEED:    0.18,      // below this speed, ball is considered stopped
+  MAX_POWER:    22,        // max cue shot impulse
+  RESTITUTION:  0.93,      // ball-ball bounce factor
+  WALL_REST:    0.78,      // ball-wall bounce factor
+  // AI
+  AI_THINK_MS:  900,       // ms before AI shoots
+  AI_ACCURACY:  0.94,      // 0–1, how accurate the aim is
+  // Rendering
+  GUIDE_DOTS:   14,        // number of aim guide dots
+  GUIDE_LEN:    220,       // length of aim guideline
+  CUE_LEN:      200,       // cue stick draw length on screen
+};
 
-/* ══════════════════════════════════════════════════════
-   § AUDIO MODULE
-   Web Audio API — generates all sounds procedurally
-   (no external files needed)
-══════════════════════════════════════════════════════ */
+// Playfield inner rect (inside cushions)
+const FIELD = {
+  get x()  { return CFG.CUSHION; },
+  get y()  { return CFG.CUSHION; },
+  get w()  { return CFG.TABLE_W - CFG.CUSHION * 2; },
+  get h()  { return CFG.TABLE_H - CFG.CUSHION * 2; },
+  get x2() { return CFG.TABLE_W - CFG.CUSHION; },
+  get y2() { return CFG.TABLE_H - CFG.CUSHION; },
+};
+
+// 6 pocket positions [x, y] in canvas coords
+function buildPockets() {
+  const r = CFG.POCKET_R;
+  const cx = CFG.CUSHION, cy = CFG.CUSHION;
+  const fw = FIELD.w, fh = FIELD.h;
+  return [
+    { x: cx,             y: cy              }, // top-left
+    { x: cx + fw / 2,    y: cy - 4          }, // top-mid
+    { x: cx + fw,        y: cy              }, // top-right
+    { x: cx,             y: cy + fh         }, // bot-left
+    { x: cx + fw / 2,    y: cy + fh + 4     }, // bot-mid
+    { x: cx + fw,        y: cy + fh         }, // bot-right
+  ];
+}
+
+// Ball colors (index 0 = cue ball, 1-7 solids, 8 = 8-ball, 9-15 stripes)
+const BALL_COLORS = [
+  '#F5F5F0', // 0  cue
+  '#F5C518', // 1  yellow solid
+  '#1A6FBF', // 2  blue solid
+  '#C0392B', // 3  red solid
+  '#8E44AD', // 4  purple solid
+  '#E67E22', // 5  orange solid
+  '#27AE60', // 6  green solid
+  '#8B1A1A', // 7  maroon solid
+  '#1a1a1a', // 8  eight ball
+  '#F5C518', // 9  yellow stripe
+  '#1A6FBF', // 10 blue stripe
+  '#C0392B', // 11 red stripe
+  '#8E44AD', // 12 purple stripe
+  '#E67E22', // 13 orange stripe
+  '#27AE60', // 14 green stripe
+  '#8B1A1A', // 15 maroon stripe
+];
+
+/* ══════════════════════════════════════════════════════════════
+   § 2. GAME STATE
+══════════════════════════════════════════════════════════════ */
+const State = {
+  // Screen management
+  screen: 'start',  // 'start' | 'game' | 'gameover'
+  vsAI: false,
+
+  // Ball array: { id, x, y, vx, vy, pocketed, number }
+  balls: [],
+
+  // Turn management
+  currentPlayer: 0,       // 0 or 1
+  playerTypes: [null, null], // 'solid' | 'stripe' | null per player
+  typesAssigned: false,
+  firstBallSunk: false,
+
+  // Shot state
+  shooting: false,      // mouse is held down for shot
+  aimAngle: 0,
+  power: 0,
+  ballsMoving: false,
+  awaitingCueBall: false, // scratch — place cue ball
+
+  // Aiming drag
+  dragStart: null,      // { x, y } in canvas coords
+  dragCurrent: null,
+
+  // Sound
+  soundOn: true,
+
+  // Pocket flash visual
+  pocketFlash: [],    // [{ x, y, t }]
+
+  // AI
+  aiThinking: false,
+  aiTimer: null,
+
+  // Which balls were pocketed this turn
+  pocketedThisTurn: [],
+
+  // Win/lose
+  winner: null,     // 0 | 1
+  winReason: '',
+};
+
+/* ══════════════════════════════════════════════════════════════
+   § 3. AUDIO ENGINE
+   All sounds generated via Web Audio API — no external files needed
+══════════════════════════════════════════════════════════════ */
 const Audio = (() => {
   let ctx = null;
-  let muted = false;
-  let musicGain = null;
-  let musicOsc = null;
-  let musicStarted = false;
+  let bgGain = null;
+  let bgNode = null;
 
-  // Lazy-init AudioContext on first user gesture
-  function init() {
-    if (ctx) return;
-    ctx = new (window.AudioContext || window.webkitAudioContext)();
-    // Master gain
-    musicGain = ctx.createGain();
-    musicGain.gain.value = 0.07;
-    musicGain.connect(ctx.destination);
+  function getCtx() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return ctx;
   }
 
-  // ── Ambient background music (simple generative) ──
-  function startMusic() {
-    if (!ctx || musicStarted || muted) return;
-    musicStarted = true;
-    const notes = [130.8, 146.8, 164.8, 196, 220, 246.9];
-    let step = 0;
-    function playNote() {
-      if (!musicStarted || muted) return;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = notes[step % notes.length] * (Math.random() > .5 ? 2 : 1);
-      gain.gain.setValueAtTime(0, ctx.currentTime);
-      gain.gain.linearRampToValueAtTime(.06, ctx.currentTime + .3);
-      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 2.5);
-      osc.connect(gain);
-      gain.connect(musicGain);
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 2.5);
-      step++;
-      setTimeout(playNote, 1200 + Math.random() * 800);
-    }
-    playNote();
-  }
-
-  function stopMusic() { musicStarted = false; }
-
-  // ── Sound Effects ──────────────────────────────────
-
-  // Cue strike — sharp thwack
-  function playCueHit(power) {
-    if (!ctx || muted) return;
-    const vol = 0.15 + power * 0.55;
-    const buf = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
-    const data = buf.getChannelData(0);
-    for (let i = 0; i < data.length; i++) {
-      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.04));
-    }
-    const src = ctx.createBufferSource();
+  /* ── Utility: play a buffer ───────────────────────────────── */
+  function playBuffer(buf, vol = 1.0, when = 0) {
+    if (!State.soundOn) return;
+    const c = getCtx();
+    const src = c.createBufferSource();
+    const gain = c.createGain();
     src.buffer = buf;
-    const gain = ctx.createGain();
     gain.gain.value = vol;
-    // Low-pass to make it woody
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 800 + power * 600;
-    src.connect(filter);
-    filter.connect(gain);
-    gain.connect(ctx.destination);
-    src.start();
+    src.connect(gain);
+    gain.connect(c.destination);
+    src.start(c.currentTime + when);
   }
 
-  // Ball-ball collision — clack
-  function playCollision(speed) {
-    if (!ctx || muted) return;
-    const vol = Math.min(0.6, speed * 0.015);
-    if (vol < 0.03) return;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = 'square';
-    osc.frequency.setValueAtTime(1200 + speed * 15, ctx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(300, ctx.currentTime + 0.06);
-    gain.gain.setValueAtTime(vol, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(); osc.stop(ctx.currentTime + 0.08);
-  }
-
-  // Ball pocketed — satisfying thunk + swoosh
-  function playPocket() {
-    if (!ctx || muted) return;
-    // Thunk
-    const buf = ctx.createBuffer(1, ctx.sampleRate * 0.2, ctx.sampleRate);
+  /* ── Build noise buffer ───────────────────────────────────── */
+  function makeNoise(duration, sampleRate = 44100) {
+    const c = getCtx();
+    const frames = Math.ceil(duration * sampleRate);
+    const buf = c.createBuffer(1, frames, sampleRate);
     const data = buf.getChannelData(0);
-    for (let i = 0; i < data.length; i++) {
-      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (ctx.sampleRate * 0.06));
-    }
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    const gain = ctx.createGain();
-    gain.gain.value = 0.5;
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.frequency.value = 400;
-    src.connect(filter);
-    filter.connect(gain);
-    gain.connect(ctx.destination);
-    src.start();
-    // Swoosh
-    const osc = ctx.createOscillator();
-    const g2 = ctx.createGain();
-    osc.frequency.setValueAtTime(600, ctx.currentTime + 0.05);
-    osc.frequency.exponentialRampToValueAtTime(80, ctx.currentTime + 0.25);
-    g2.gain.setValueAtTime(0.15, ctx.currentTime + 0.05);
-    g2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
-    osc.connect(g2);
-    g2.connect(ctx.destination);
-    osc.start(ctx.currentTime + 0.05);
-    osc.stop(ctx.currentTime + 0.3);
+    for (let i = 0; i < frames; i++) data[i] = (Math.random() * 2 - 1);
+    return buf;
   }
 
-  // Cushion bounce
-  function playRail() {
-    if (!ctx || muted) return;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(180, ctx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(60, ctx.currentTime + 0.1);
-    gain.gain.setValueAtTime(0.08, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(); osc.stop(ctx.currentTime + 0.12);
+  /* ── Cue stick hit sound ──────────────────────────────────── */
+  function hitCue(power) {
+    if (!State.soundOn) return;
+    const c = getCtx();
+    const now = c.currentTime;
+    const vol = 0.3 + power * 0.7;
+
+    // Sharp transient click
+    const osc = c.createOscillator();
+    const g = c.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(800, now);
+    osc.frequency.exponentialRampToValueAtTime(120, now + 0.08);
+    g.gain.setValueAtTime(vol * 0.6, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+    osc.connect(g); g.connect(c.destination);
+    osc.start(now); osc.stop(now + 0.15);
+
+    // Clack noise burst
+    const nBuf = makeNoise(0.06);
+    const ng = c.createGain();
+    const nf = c.createBiquadFilter();
+    nf.type = 'bandpass'; nf.frequency.value = 2000;
+    ng.gain.setValueAtTime(vol * 0.4, now);
+    ng.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+    const ns = c.createBufferSource();
+    ns.buffer = nBuf;
+    ns.connect(nf); nf.connect(ng); ng.connect(c.destination);
+    ns.start(now);
   }
 
-  // Win fanfare
-  function playWin() {
-    if (!ctx || muted) return;
-    const melody = [523.25, 659.25, 783.99, 1046.5];
-    melody.forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      const t = ctx.currentTime + i * 0.18;
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0, t);
-      gain.gain.linearRampToValueAtTime(0.3, t + 0.05);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(t); osc.stop(t + 0.5);
+  /* ── Ball-ball collision ──────────────────────────────────── */
+  function hitBall(speed) {
+    if (!State.soundOn) return;
+    const c = getCtx();
+    const now = c.currentTime;
+    const vol = Math.min(1, speed / 8) * 0.5;
+
+    const osc = c.createOscillator();
+    const g = c.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(1200 + speed * 40, now);
+    osc.frequency.exponentialRampToValueAtTime(300, now + 0.05);
+    g.gain.setValueAtTime(vol, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.07);
+    osc.connect(g); g.connect(c.destination);
+    osc.start(now); osc.stop(now + 0.08);
+  }
+
+  /* ── Cushion hit ──────────────────────────────────────────── */
+  function hitWall(speed) {
+    if (!State.soundOn) return;
+    const c = getCtx();
+    const now = c.currentTime;
+    const vol = Math.min(1, speed / 6) * 0.35;
+
+    const osc = c.createOscillator();
+    const g = c.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(180, now);
+    osc.frequency.exponentialRampToValueAtTime(60, now + 0.15);
+    g.gain.setValueAtTime(vol, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+    osc.connect(g); g.connect(c.destination);
+    osc.start(now); osc.stop(now + 0.22);
+  }
+
+  /* ── Pocket sound ─────────────────────────────────────────── */
+  function pocket() {
+    if (!State.soundOn) return;
+    const c = getCtx();
+    const now = c.currentTime;
+
+    // Thud
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(90, now);
+    o.frequency.exponentialRampToValueAtTime(30, now + 0.3);
+    g.gain.setValueAtTime(0.6, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+    o.connect(g); g.connect(c.destination);
+    o.start(now); o.stop(now + 0.36);
+
+    // Rumble
+    const nBuf = makeNoise(0.25);
+    const ng = c.createGain();
+    const nf = c.createBiquadFilter();
+    nf.type = 'lowpass'; nf.frequency.value = 300;
+    ng.gain.setValueAtTime(0.3, now);
+    ng.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+    const ns = c.createBufferSource();
+    ns.buffer = nBuf;
+    ns.connect(nf); nf.connect(ng); ng.connect(c.destination);
+    ns.start(now);
+  }
+
+  /* ── Background ambient music ─────────────────────────────── */
+  function startBGM() {
+    if (!State.soundOn) return;
+    if (bgNode) return;
+    const c = getCtx();
+
+    // Smooth jazz-ish drone using layered oscillators
+    bgGain = c.createGain();
+    bgGain.gain.value = 0.04;
+    bgGain.connect(c.destination);
+
+    const freqs = [65.4, 98, 130.8, 196, 261.6];
+    freqs.forEach((f, i) => {
+      const o = c.createOscillator();
+      const g = c.createGain();
+      o.type = 'sine';
+      o.frequency.value = f;
+      g.gain.value = 0.3 / (i + 1);
+      // Slow vibrato
+      const lfo = c.createOscillator();
+      const lfoGain = c.createGain();
+      lfo.frequency.value = 0.2 + i * 0.05;
+      lfoGain.gain.value = 0.4;
+      lfo.connect(lfoGain);
+      lfoGain.connect(o.frequency);
+      lfo.start();
+      o.connect(g); g.connect(bgGain);
+      o.start();
     });
+    bgNode = bgGain;
   }
 
-  function toggleMute() {
-    muted = !muted;
-    if (muted) stopMusic();
-    else { startMusic(); }
-    return muted;
+  function stopBGM() {
+    if (bgGain) { bgGain.gain.value = 0; bgNode = null; }
   }
 
-  function isMuted() { return muted; }
+  function toggleSound() {
+    State.soundOn = !State.soundOn;
+    if (State.soundOn) startBGM(); else stopBGM();
+    return State.soundOn;
+  }
 
-  return { init, startMusic, stopMusic, playCueHit, playCollision, playPocket, playRail, toggleMute, isMuted };
+  return { hitCue, hitBall, hitWall, pocket, startBGM, stopBGM, toggleSound, getCtx };
 })();
 
+/* ══════════════════════════════════════════════════════════════
+   § 4. BALL SETUP
+══════════════════════════════════════════════════════════════ */
 
-/* ══════════════════════════════════════════════════════
-   § CONSTANTS & CONFIGURATION
-══════════════════════════════════════════════════════ */
-const CFG = {
-  BALL_RADIUS: 14,        // px (will scale with canvas)
-  FRICTION:    0.985,     // rolling friction per frame
-  MIN_SPEED:   0.08,      // speed below which ball stops
-  MAX_SHOT_POWER: 22,     // max initial velocity magnitude
-  CUE_DRAG_SCALE: 0.18,   // maps drag distance → power
-  POCKET_RADIUS: 19,      // px
-  RAIL_BOUNCE:  0.72,     // energy kept on rail bounce
-  BALL_BOUNCE:  0.88,     // energy kept on ball collision
-};
+/** Creates a ball object */
+function makeBall(id, x, y) {
+  return { id, x, y, vx: 0, vy: 0, pocketed: false, spin: 0 };
+}
 
-// Ball colours — classic pool set
-const BALL_COLORS = {
-  1:  { solid: true,  color: '#f5d800', stripe: null },
-  2:  { solid: true,  color: '#1a44c2', stripe: null },
-  3:  { solid: true,  color: '#d42020', stripe: null },
-  4:  { solid: true,  color: '#6b1fa0', stripe: null },
-  5:  { solid: true,  color: '#e87020', stripe: null },
-  6:  { solid: true,  color: '#1a8c3a', stripe: null },
-  7:  { solid: true,  color: '#8b1a1a', stripe: null },
-  8:  { solid: true,  color: '#111111', stripe: null },
-  9:  { solid: false, color: '#f5d800', stripe: true },
-  10: { solid: false, color: '#1a44c2', stripe: true },
-  11: { solid: false, color: '#d42020', stripe: true },
-  12: { solid: false, color: '#6b1fa0', stripe: true },
-  13: { solid: false, color: '#e87020', stripe: true },
-  14: { solid: false, color: '#1a8c3a', stripe: true },
-  15: { solid: false, color: '#8b1a1a', stripe: true },
-};
+/** Standard rack positions for 15 balls in triangle formation */
+function rackBalls() {
+  const R = CFG.BALL_R;
+  const balls = [];
 
+  // Cue ball
+  balls.push(makeBall(0, FIELD.x + FIELD.w * 0.25, FIELD.y + FIELD.h / 2));
 
-/* ══════════════════════════════════════════════════════
-   § MATH UTILITIES
-══════════════════════════════════════════════════════ */
-const Vec = {
-  add:  (a, b) => ({ x: a.x + b.x, y: a.y + b.y }),
-  sub:  (a, b) => ({ x: a.x - b.x, y: a.y - b.y }),
-  scale:(v, s) => ({ x: v.x * s,   y: v.y * s }),
-  dot:  (a, b) => a.x * b.x + a.y * b.y,
-  len:  (v)    => Math.sqrt(v.x * v.x + v.y * v.y),
-  norm: (v)    => { const l = Vec.len(v); return l ? Vec.scale(v, 1/l) : {x:0,y:0}; },
-  dist: (a, b) => Vec.len(Vec.sub(a, b)),
-};
+  // Rack tip at the foot spot
+  const rackX = FIELD.x + FIELD.w * 0.73;
+  const rackY = FIELD.y + FIELD.h / 2;
+  const rowSpacingX = R * 2 * Math.cos(Math.PI / 6);   // ~√3 * R
+  const rowSpacingY = R * 2;
 
+  // Ball arrangement (indices into BALL_COLORS) — 8 must be center of triangle
+  // Standard rack: 8 in center, alternating solids/stripes on corners
+  const order = [1, 9, 2, 10, 8, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+  let ballIdx = 0;
 
-/* ══════════════════════════════════════════════════════
-   § PHYSICS ENGINE
-   Handles: ball movement, collisions, pocketing
-══════════════════════════════════════════════════════ */
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col <= row; col++) {
+      const bx = rackX + row * rowSpacingX;
+      const by = rackY + (col - row / 2) * rowSpacingY;
+      balls.push(makeBall(order[ballIdx], bx, by));
+      ballIdx++;
+    }
+  }
+  return balls;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   § 5. PHYSICS ENGINE
+══════════════════════════════════════════════════════════════ */
 const Physics = (() => {
-  // Called once per frame — updates all ball positions
-  function step(balls, table) {
-    const pocketed = [];
 
+  const POCKETS = buildPockets();
+
+  /** Move all balls one frame, apply friction, check walls & pockets */
+  function step(balls, dt = 1) {
+    let anyMoving = false;
+    const pocketedNow = [];
+
+    // Move each ball
     balls.forEach(ball => {
       if (ball.pocketed) return;
+      if (Math.abs(ball.vx) < CFG.MIN_SPEED && Math.abs(ball.vy) < CFG.MIN_SPEED) {
+        ball.vx = 0; ball.vy = 0;
+        return;
+      }
+      anyMoving = true;
 
-      // Apply velocity
-      ball.x += ball.vx;
-      ball.y += ball.vy;
+      ball.x += ball.vx * dt;
+      ball.y += ball.vy * dt;
+      ball.spin += (ball.vx * 0.01); // visual spin
 
-      // Spin/angular momentum (visual only)
-      ball.spin += Vec.len({ x: ball.vx, y: ball.vy }) * 0.08;
-
-      // Apply friction
+      // Friction
       ball.vx *= CFG.FRICTION;
       ball.vy *= CFG.FRICTION;
-
-      // Stop micro-drift
-      if (Math.abs(ball.vx) < CFG.MIN_SPEED) ball.vx = 0;
-      if (Math.abs(ball.vy) < CFG.MIN_SPEED) ball.vy = 0;
-
-      // Rail collisions
-      const r = CFG.BALL_RADIUS;
-      if (ball.x - r < table.left) {
-        ball.x = table.left + r;
-        ball.vx = Math.abs(ball.vx) * CFG.RAIL_BOUNCE;
-        Audio.playRail();
-      }
-      if (ball.x + r > table.right) {
-        ball.x = table.right - r;
-        ball.vx = -Math.abs(ball.vx) * CFG.RAIL_BOUNCE;
-        Audio.playRail();
-      }
-      if (ball.y - r < table.top) {
-        ball.y = table.top + r;
-        ball.vy = Math.abs(ball.vy) * CFG.RAIL_BOUNCE;
-        Audio.playRail();
-      }
-      if (ball.y + r > table.bottom) {
-        ball.y = table.bottom - r;
-        ball.vy = -Math.abs(ball.vy) * CFG.RAIL_BOUNCE;
-        Audio.playRail();
-      }
     });
 
-    // Ball-ball collisions (O(n²) — fine for 16 balls)
+    // Ball-wall collisions
+    balls.forEach(ball => {
+      if (ball.pocketed) return;
+      wallCollide(ball);
+    });
+
+    // Ball-ball collisions (n² for simplicity — 15 balls is fine)
     for (let i = 0; i < balls.length; i++) {
       for (let j = i + 1; j < balls.length; j++) {
-        const a = balls[i], b = balls[j];
-        if (a.pocketed || b.pocketed) continue;
-        resolveCollision(a, b);
+        if (balls[i].pocketed || balls[j].pocketed) continue;
+        ballCollide(balls[i], balls[j]);
       }
     }
 
     // Pocket detection
-    table.pockets.forEach(pocket => {
-      balls.forEach(ball => {
-        if (ball.pocketed) return;
-        if (Vec.dist(ball, pocket) < CFG.POCKET_RADIUS) {
+    balls.forEach(ball => {
+      if (ball.pocketed) return;
+      POCKETS.forEach(p => {
+        const dx = ball.x - p.x;
+        const dy = ball.y - p.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < CFG.POCKET_R + CFG.BALL_R * 0.5) {
           ball.pocketed = true;
           ball.vx = 0; ball.vy = 0;
-          pocketed.push(ball);
-          Audio.playPocket();
+          pocketedNow.push({ ball, pocket: p });
+          Audio.pocket();
+          State.pocketFlash.push({ x: p.x, y: p.y, t: 1.0 });
         }
       });
     });
 
-    return pocketed;
+    return { anyMoving, pocketedNow };
   }
 
-  // Elastic collision between two balls
-  function resolveCollision(a, b) {
+  /** Reflect ball off table cushions */
+  function wallCollide(ball) {
+    const R = CFG.BALL_R;
+    let hit = false;
+
+    if (ball.x - R < FIELD.x) {
+      ball.x = FIELD.x + R;
+      ball.vx = Math.abs(ball.vx) * CFG.WALL_REST;
+      hit = true;
+    } else if (ball.x + R > FIELD.x2) {
+      ball.x = FIELD.x2 - R;
+      ball.vx = -Math.abs(ball.vx) * CFG.WALL_REST;
+      hit = true;
+    }
+    if (ball.y - R < FIELD.y) {
+      ball.y = FIELD.y + R;
+      ball.vy = Math.abs(ball.vy) * CFG.WALL_REST;
+      hit = true;
+    } else if (ball.y + R > FIELD.y2) {
+      ball.y = FIELD.y2 - R;
+      ball.vy = -Math.abs(ball.vy) * CFG.WALL_REST;
+      hit = true;
+    }
+    if (hit) {
+      const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+      if (speed > 0.5) Audio.hitWall(speed);
+    }
+  }
+
+  /** Elastic collision between two balls */
+  function ballCollide(a, b) {
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    const minDist = CFG.BALL_RADIUS * 2;
+    const minDist = CFG.BALL_R * 2;
 
-    if (dist >= minDist || dist === 0) return;
+    if (dist >= minDist || dist < 0.001) return;
 
-    // Separate overlapping balls
-    const overlap = (minDist - dist) / 2;
+    // Normalize
     const nx = dx / dist;
     const ny = dy / dist;
+
+    // Overlap resolution
+    const overlap = (minDist - dist) / 2;
     a.x -= nx * overlap;
     a.y -= ny * overlap;
     b.x += nx * overlap;
     b.y += ny * overlap;
 
-    // Exchange velocity components along collision normal
+    // Relative velocity along normal
     const dvx = b.vx - a.vx;
     const dvy = b.vy - a.vy;
     const dot = dvx * nx + dvy * ny;
-    if (dot > 0) return; // Already separating
 
-    const impulse = dot * CFG.BALL_BOUNCE;
+    if (dot >= 0) return; // Already separating
+
+    const impulse = dot * CFG.RESTITUTION;
     a.vx += impulse * nx;
     a.vy += impulse * ny;
     b.vx -= impulse * nx;
     b.vy -= impulse * ny;
 
-    const speed = Vec.len({ x: dvx, y: dvy });
-    Audio.playCollision(speed);
+    const speed = Math.abs(dot);
+    if (speed > 0.3) Audio.hitBall(speed);
   }
 
-  // Check if all balls have stopped moving
-  function isAtRest(balls) {
-    return balls.every(b => b.pocketed || (Math.abs(b.vx) < CFG.MIN_SPEED && Math.abs(b.vy) < CFG.MIN_SPEED));
+  /** Shoot the cue ball with given angle and power */
+  function shootCue(angle, power) {
+    const cue = State.balls.find(b => b.id === 0);
+    if (!cue) return;
+    const force = power * CFG.MAX_POWER;
+    cue.vx = Math.cos(angle) * force;
+    cue.vy = Math.sin(angle) * force;
+    Audio.hitCue(power);
   }
 
-  return { step, isAtRest };
+  /** Get all movable balls' velocity sum — tells us if still rolling */
+  function anyMoving(balls) {
+    return balls.some(b => !b.pocketed &&
+      (Math.abs(b.vx) > CFG.MIN_SPEED || Math.abs(b.vy) > CFG.MIN_SPEED));
+  }
+
+  return { step, shootCue, anyMoving, POCKETS };
 })();
 
-
-/* ══════════════════════════════════════════════════════
-   § RENDERER
-   Canvas 2D drawing — table, balls, cue, guidelines
-══════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════
+   § 6. RENDERER
+══════════════════════════════════════════════════════════════ */
 const Renderer = (() => {
-
   let canvas, ctx;
-  // Camera zoom state for aiming effect
-  const cam = { zoom: 1, targetZoom: 1, ox: 0, oy: 0, targetOx: 0, targetOy: 0 };
+  let offscreen, offCtx; // for table background caching
 
-  function init(c) {
-    canvas = c;
-    ctx = c.getContext('2d');
+  const POCKETS = buildPockets();
+
+  function init(canvasEl) {
+    canvas = canvasEl;
+    canvas.width  = CFG.TABLE_W;
+    canvas.height = CFG.TABLE_H;
+    ctx = canvas.getContext('2d');
+    buildOffscreenTable();
   }
 
-  // ── Camera helpers ─────────────────────────────────
-  function updateCamera(aimActive, cueBall) {
-    cam.targetZoom = aimActive ? 1.18 : 1;
-    cam.targetOx   = aimActive ? cueBall.x * (cam.targetZoom - 1) * -0.5 : 0;
-    cam.targetOy   = aimActive ? cueBall.y * (cam.targetZoom - 1) * -0.5 : 0;
-    cam.zoom += (cam.targetZoom - cam.zoom) * 0.07;
-    cam.ox   += (cam.targetOx   - cam.ox)   * 0.07;
-    cam.oy   += (cam.targetOy   - cam.oy)   * 0.07;
+  /* ── Pre-render the static table into an offscreen canvas ── */
+  function buildOffscreenTable() {
+    offscreen = document.createElement('canvas');
+    offscreen.width  = CFG.TABLE_W;
+    offscreen.height = CFG.TABLE_H;
+    offCtx = offscreen.getContext('2d');
+    drawStaticTable(offCtx);
   }
 
-  // ── Main draw call ─────────────────────────────────
-  function draw(state) {
-    const { table, balls, aim, cueState } = state;
-    const W = canvas.width, H = canvas.height;
-
-    updateCamera(aim.dragging, balls[0]);
-
-    ctx.clearRect(0, 0, W, H);
-
-    // Apply camera transform
-    ctx.save();
-    ctx.translate(W / 2, H / 2);
-    ctx.scale(cam.zoom, cam.zoom);
-    ctx.translate(-W / 2 + cam.ox, -H / 2 + cam.oy);
-
-    drawRoom(W, H);
-    drawTable(table);
-    drawGuidelines(balls, aim, table);
-    drawBalls(balls);
-    if (aim.dragging || cueState.visible) drawCue(balls[0], aim, cueState);
-
-    ctx.restore();
-  }
-
-  // ── Room / background ──────────────────────────────
-  function drawRoom(W, H) {
-    const grd = ctx.createRadialGradient(W/2, H/2, H*0.1, W/2, H*0.4, H*0.85);
-    grd.addColorStop(0, '#1a1f14');
-    grd.addColorStop(0.5, '#0e1008');
-    grd.addColorStop(1, '#05060a');
-    ctx.fillStyle = grd;
-    ctx.fillRect(0, 0, W, H);
-
-    // Overhead light halo
-    const light = ctx.createRadialGradient(W/2, H*0.35, 10, W/2, H*0.35, H*0.55);
-    light.addColorStop(0, 'rgba(255,240,200,.09)');
-    light.addColorStop(1, 'transparent');
-    ctx.fillStyle = light;
-    ctx.fillRect(0, 0, W, H);
-  }
-
-  // ── Table ──────────────────────────────────────────
-  function drawTable(table) {
-    const { left, top, right, bottom, railW } = table;
-    const rl = left - railW, rt = top - railW;
-    const rw = (right - left) + railW * 2;
-    const rh = (bottom - top) + railW * 2;
-    const radius = railW * 0.9;
-
-    // Outer wood shadow
-    ctx.shadowColor = 'rgba(0,0,0,.8)';
-    ctx.shadowBlur = 40;
-
-    // Wood rail body
-    const woodGrad = ctx.createLinearGradient(rl, rt, rl + rw, rt + rh);
-    woodGrad.addColorStop(0, '#6b3c18');
-    woodGrad.addColorStop(0.3, '#8a4f22');
-    woodGrad.addColorStop(0.7, '#5c3317');
-    woodGrad.addColorStop(1, '#3d2010');
-    roundRect(rl, rt, rw, rh, radius, woodGrad);
-
-    ctx.shadowBlur = 0;
+  function drawStaticTable(c) {
+    // ── Outer wood frame ──────────────────────────────────────
+    const woodGrad = c.createLinearGradient(0, 0, CFG.TABLE_W, CFG.TABLE_H);
+    woodGrad.addColorStop(0,   '#5a3a18');
+    woodGrad.addColorStop(0.3, '#7a4e22');
+    woodGrad.addColorStop(0.5, '#8a5a28');
+    woodGrad.addColorStop(0.7, '#7a4e22');
+    woodGrad.addColorStop(1,   '#4a2e10');
+    c.fillStyle = woodGrad;
+    c.beginPath();
+    c.roundRect(0, 0, CFG.TABLE_W, CFG.TABLE_H, 18);
+    c.fill();
 
     // Wood grain lines
-    ctx.save();
-    ctx.beginPath();
-    roundRectPath(rl, rt, rw, rh, radius);
-    ctx.clip();
-    ctx.strokeStyle = 'rgba(0,0,0,.12)';
-    ctx.lineWidth = 1;
-    for (let i = 0; i < 20; i++) {
-      ctx.beginPath();
-      ctx.moveTo(rl + i * (rw / 20), rt);
-      ctx.lineTo(rl + i * (rw / 20) + rh * 0.1, rt + rh);
-      ctx.stroke();
+    c.save();
+    c.globalAlpha = 0.06;
+    for (let i = 0; i < 30; i++) {
+      const x = Math.random() * CFG.TABLE_W;
+      c.strokeStyle = '#000';
+      c.lineWidth = Math.random() * 2;
+      c.beginPath();
+      c.moveTo(x, 0); c.lineTo(x + 20, CFG.TABLE_H);
+      c.stroke();
     }
-    // Highlight on top edge
-    ctx.strokeStyle = 'rgba(255,200,120,.18)';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(rl + radius, rt + 2);
-    ctx.lineTo(rl + rw - radius, rt + 2);
-    ctx.stroke();
-    ctx.restore();
+    c.restore();
 
-    // Felt surface
-    const feltGrad = ctx.createRadialGradient(
-      (left + right) / 2, (top + bottom) / 2, 20,
-      (left + right) / 2, (top + bottom) / 2, (right - left) * 0.7
+    // Wood highlight (top edge reflection)
+    const hlGrad = c.createLinearGradient(0, 0, 0, CFG.CUSHION);
+    hlGrad.addColorStop(0, 'rgba(255,220,120,0.18)');
+    hlGrad.addColorStop(1, 'rgba(255,220,120,0)');
+    c.fillStyle = hlGrad;
+    c.fillRect(0, 0, CFG.TABLE_W, CFG.CUSHION);
+
+    // ── Felt surface ──────────────────────────────────────────
+    const feltGrad = c.createRadialGradient(
+      CFG.TABLE_W / 2, CFG.TABLE_H / 2, 0,
+      CFG.TABLE_W / 2, CFG.TABLE_H / 2, Math.max(CFG.TABLE_W, CFG.TABLE_H) * 0.65
     );
-    feltGrad.addColorStop(0, '#1f8040');
-    feltGrad.addColorStop(0.6, '#1a6b3c');
-    feltGrad.addColorStop(1, '#134f2d');
-    ctx.fillStyle = feltGrad;
-    ctx.fillRect(left, top, right - left, bottom - top);
+    feltGrad.addColorStop(0,   '#256038');
+    feltGrad.addColorStop(0.5, '#1e5030');
+    feltGrad.addColorStop(1,   '#163d24');
+    c.fillStyle = feltGrad;
+    c.fillRect(FIELD.x, FIELD.y, FIELD.w, FIELD.h);
 
-    // Felt texture (subtle noise pattern)
-    ctx.save();
-    ctx.globalAlpha = 0.04;
-    for (let y = top; y < bottom; y += 4) {
-      for (let x = left; x < right; x += 4) {
-        if (Math.random() > .5) {
-          ctx.fillStyle = '#fff';
-          ctx.fillRect(x, y, 2, 2);
-        }
-      }
+    // Felt texture (subtle grid)
+    c.save();
+    c.globalAlpha = 0.035;
+    c.strokeStyle = '#000';
+    c.lineWidth = 1;
+    for (let x = FIELD.x; x < FIELD.x2; x += 8) {
+      c.beginPath(); c.moveTo(x, FIELD.y); c.lineTo(x, FIELD.y2); c.stroke();
     }
-    ctx.globalAlpha = 1;
-    ctx.restore();
+    for (let y = FIELD.y; y < FIELD.y2; y += 8) {
+      c.beginPath(); c.moveTo(FIELD.x, y); c.lineTo(FIELD.x2, y); c.stroke();
+    }
+    c.restore();
 
-    // Center line & spot
-    ctx.strokeStyle = 'rgba(255,255,255,.08)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([6, 6]);
-    ctx.beginPath();
-    ctx.moveTo((left + right) / 2, top + 10);
-    ctx.lineTo((left + right) / 2, bottom - 10);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // Overhead light bloom on felt
+    const lightBloom = c.createRadialGradient(
+      CFG.TABLE_W / 2, CFG.TABLE_H / 2, 0,
+      CFG.TABLE_W / 2, CFG.TABLE_H / 2, CFG.TABLE_W * 0.4
+    );
+    lightBloom.addColorStop(0,   'rgba(255,255,220,0.08)');
+    lightBloom.addColorStop(0.5, 'rgba(255,255,220,0.02)');
+    lightBloom.addColorStop(1,   'rgba(0,0,0,0)');
+    c.fillStyle = lightBloom;
+    c.fillRect(FIELD.x, FIELD.y, FIELD.w, FIELD.h);
 
-    ctx.fillStyle = 'rgba(255,255,255,.12)';
-    ctx.beginPath();
-    ctx.arc((left + right) / 2, (top + bottom) / 2, 4, 0, Math.PI * 2);
-    ctx.fill();
+    // ── Cushion rails ──────────────────────────────────────────
+    drawCushions(c);
 
-    // "D" baulk line & semicircle
-    const baulkX = left + (right - left) * 0.22;
-    const dRadius = (bottom - top) * 0.14;
-    ctx.strokeStyle = 'rgba(255,255,255,.1)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(baulkX, top + 8);
-    ctx.lineTo(baulkX, bottom - 8);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(baulkX, (top + bottom) / 2, dRadius, Math.PI * 0.5, Math.PI * 1.5);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // ── Center line (decorative) ───────────────────────────────
+    c.save();
+    c.strokeStyle = 'rgba(255,255,255,0.06)';
+    c.lineWidth = 1;
+    c.setLineDash([4, 8]);
+    c.beginPath();
+    c.moveTo(CFG.TABLE_W / 2, FIELD.y);
+    c.lineTo(CFG.TABLE_W / 2, FIELD.y2);
+    c.stroke();
+    c.setLineDash([]);
+    c.restore();
 
-    // Pockets
-    table.pockets.forEach(p => drawPocket(p));
+    // Head string (baulk line)
+    c.save();
+    c.strokeStyle = 'rgba(255,255,255,0.05)';
+    c.lineWidth = 1;
+    c.beginPath();
+    c.moveTo(FIELD.x + FIELD.w * 0.25, FIELD.y + 4);
+    c.lineTo(FIELD.x + FIELD.w * 0.25, FIELD.y2 - 4);
+    c.stroke();
+    c.restore();
+
+    // Foot spot
+    c.fillStyle = 'rgba(255,255,255,0.18)';
+    c.beginPath();
+    c.arc(FIELD.x + FIELD.w * 0.73, FIELD.y + FIELD.h / 2, 3, 0, Math.PI * 2);
+    c.fill();
+
+    // Head spot
+    c.beginPath();
+    c.arc(FIELD.x + FIELD.w * 0.25, FIELD.y + FIELD.h / 2, 3, 0, Math.PI * 2);
+    c.fill();
+
+    // ── Pocket holes ───────────────────────────────────────────
+    drawPockets(c);
   }
 
-  // Single pocket
-  function drawPocket(p) {
-    // Outer dark ring
-    ctx.fillStyle = '#111';
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, CFG.POCKET_RADIUS + 4, 0, Math.PI * 2);
-    ctx.fill();
+  function drawCushions(c) {
+    const cs = CFG.CUSHION;
+    // Each rail segment as a trapezoid with gradient
+    const railParts = [
+      // top
+      { points: [[cs,0],[CFG.TABLE_W-cs,0],[CFG.TABLE_W-cs,cs],[cs,cs]], vertical: true },
+      // bottom
+      { points: [[cs,CFG.TABLE_H-cs],[CFG.TABLE_W-cs,CFG.TABLE_H-cs],[CFG.TABLE_W-cs,CFG.TABLE_H],[cs,CFG.TABLE_H]], vertical: true },
+      // left
+      { points: [[0,cs],[cs,cs],[cs,CFG.TABLE_H-cs],[0,CFG.TABLE_H-cs]], vertical: false },
+      // right
+      { points: [[CFG.TABLE_W-cs,cs],[CFG.TABLE_W,cs],[CFG.TABLE_W,CFG.TABLE_H-cs],[CFG.TABLE_W-cs,CFG.TABLE_H-cs]], vertical: false },
+    ];
 
-    // Inner void
-    const pg = ctx.createRadialGradient(p.x, p.y, 2, p.x, p.y, CFG.POCKET_RADIUS);
-    pg.addColorStop(0, '#000');
-    pg.addColorStop(0.7, '#0a0a0a');
-    pg.addColorStop(1, '#1a1a1a');
-    ctx.fillStyle = pg;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, CFG.POCKET_RADIUS, 0, Math.PI * 2);
-    ctx.fill();
+    railParts.forEach(({ points, vertical }) => {
+      const grad = vertical
+        ? c.createLinearGradient(0, points[0][1], 0, points[2][1])
+        : c.createLinearGradient(points[0][0], 0, points[1][0], 0);
+      grad.addColorStop(0,   '#2a6040');
+      grad.addColorStop(0.4, '#1e5030');
+      grad.addColorStop(1,   '#163a22');
+      c.fillStyle = grad;
+      c.beginPath();
+      c.moveTo(points[0][0], points[0][1]);
+      points.slice(1).forEach(([x, y]) => c.lineTo(x, y));
+      c.closePath();
+      c.fill();
 
-    // Rim highlight
-    ctx.strokeStyle = 'rgba(255,200,100,.25)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, CFG.POCKET_RADIUS + 1, Math.PI, Math.PI * 1.7);
-    ctx.stroke();
+      // Rail highlight
+      c.save();
+      c.globalAlpha = 0.12;
+      c.strokeStyle = '#7fff90';
+      c.lineWidth = 1;
+      c.stroke();
+      c.restore();
+    });
   }
 
-  // ── Aim guidelines ─────────────────────────────────
-  function drawGuidelines(balls, aim, table) {
-    if (!aim.dragging && !aim.showLine) return;
-    const cue = balls[0];
-    if (!cue || cue.pocketed) return;
+  function drawPockets(c) {
+    POCKETS.forEach(p => {
+      // Dark hole
+      const holeGrad = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, CFG.POCKET_R);
+      holeGrad.addColorStop(0,   '#050505');
+      holeGrad.addColorStop(0.7, '#0a0a0a');
+      holeGrad.addColorStop(1,   '#1a1a1a');
+      c.fillStyle = holeGrad;
+      c.beginPath();
+      c.arc(p.x, p.y, CFG.POCKET_R, 0, Math.PI * 2);
+      c.fill();
 
-    const angle = aim.angle;
-    const dx = Math.cos(angle);
-    const dy = Math.sin(angle);
+      // Pocket ring
+      c.strokeStyle = '#7a5010';
+      c.lineWidth = 3;
+      c.beginPath();
+      c.arc(p.x, p.y, CFG.POCKET_R, 0, Math.PI * 2);
+      c.stroke();
 
-    // Trace the cue ball path up to 2 reflections
-    let x = cue.x, y = cue.y;
-    let vx = dx, vy = dy;
-    const { left, top, right, bottom } = table;
-    const r = CFG.BALL_RADIUS;
+      // Inner glow ring
+      c.strokeStyle = 'rgba(255,180,50,0.15)';
+      c.lineWidth = 1;
+      c.beginPath();
+      c.arc(p.x, p.y, CFG.POCKET_R - 2, 0, Math.PI * 2);
+      c.stroke();
+    });
+  }
 
-    // Check first ball hit
+  /* ── Draw a single pool ball with gloss effect ────────────── */
+  function drawBall(c, ball) {
+    if (ball.pocketed) return;
+
+    const { x, y, id } = ball;
+    const R = CFG.BALL_R;
+    const color = BALL_COLORS[id] || '#888';
+    const isStripe = id >= 9 && id <= 15;
+    const is8Ball = id === 8;
+
+    c.save();
+    c.translate(x, y);
+    c.rotate(ball.spin || 0);
+
+    // Drop shadow
+    c.save();
+    const shadowGrad = c.createRadialGradient(3, 5, 0, 3, 5, R * 1.4);
+    shadowGrad.addColorStop(0,   'rgba(0,0,0,0.5)');
+    shadowGrad.addColorStop(1,   'rgba(0,0,0,0)');
+    c.fillStyle = shadowGrad;
+    c.beginPath();
+    c.ellipse(3, 5, R * 1.2, R * 0.7, 0, 0, Math.PI * 2);
+    c.fill();
+    c.restore();
+
+    // Base ball color
+    const baseGrad = c.createRadialGradient(-R * 0.3, -R * 0.3, 0, 0, 0, R);
+    if (is8Ball) {
+      baseGrad.addColorStop(0, '#3a3a3a');
+      baseGrad.addColorStop(1, '#050505');
+    } else {
+      baseGrad.addColorStop(0, lightenColor(color, 40));
+      baseGrad.addColorStop(0.6, color);
+      baseGrad.addColorStop(1, darkenColor(color, 60));
+    }
+    c.fillStyle = baseGrad;
+    c.beginPath();
+    c.arc(0, 0, R, 0, Math.PI * 2);
+    c.fill();
+
+    // Stripe band for 9-15
+    if (isStripe) {
+      c.save();
+      c.beginPath();
+      c.arc(0, 0, R, 0, Math.PI * 2);
+      c.clip();
+      // White background stripe
+      c.fillStyle = '#F5F5F0';
+      c.fillRect(-R, -R * 0.55, R * 2, R * 1.1);
+      // Color stripe on top of white
+      const stripeGrad = c.createLinearGradient(0, -R * 0.45, 0, R * 0.45);
+      stripeGrad.addColorStop(0, lightenColor(color, 20));
+      stripeGrad.addColorStop(0.5, color);
+      stripeGrad.addColorStop(1, darkenColor(color, 30));
+      c.fillStyle = stripeGrad;
+      c.fillRect(-R, -R * 0.45, R * 2, R * 0.9);
+      c.restore();
+    }
+
+    // White number circle
+    if (id !== 0) {
+      c.fillStyle = 'rgba(255,255,255,0.92)';
+      c.beginPath();
+      c.arc(0, 0, R * 0.38, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = '#111';
+      c.font = `bold ${R * 0.55}px Rajdhani, sans-serif`;
+      c.textAlign = 'center';
+      c.textBaseline = 'middle';
+      c.fillText(id, 0, 1);
+    }
+
+    // Glossy highlight (top-left)
+    const gloss = c.createRadialGradient(-R * 0.35, -R * 0.38, 0, -R * 0.2, -R * 0.2, R * 0.7);
+    gloss.addColorStop(0,   'rgba(255,255,255,0.65)');
+    gloss.addColorStop(0.25,'rgba(255,255,255,0.18)');
+    gloss.addColorStop(1,   'rgba(255,255,255,0)');
+    c.fillStyle = gloss;
+    c.beginPath();
+    c.arc(0, 0, R, 0, Math.PI * 2);
+    c.fill();
+
+    // Small specular dot
+    c.fillStyle = 'rgba(255,255,255,0.8)';
+    c.beginPath();
+    c.arc(-R * 0.32, -R * 0.35, R * 0.12, 0, Math.PI * 2);
+    c.fill();
+
+    c.restore();
+  }
+
+  /* ── Draw aim guideline ───────────────────────────────────── */
+  function drawAimGuide(c, cueBall, angle) {
+    if (!cueBall || cueBall.pocketed) return;
+
+    const R = CFG.BALL_R;
+    // Trace ray from cue ball
+    let rx = cueBall.x, ry = cueBall.y;
+    const dx = Math.cos(angle), dy = Math.sin(angle);
+
+    // Find first collision point (simplified ray-march)
     let hitBall = null;
-    let hitT = Infinity;
-    balls.forEach(b => {
-      if (b === cue || b.pocketed) return;
-      const t = rayCircleIntersect(x, y, vx, vy, b.x, b.y, r * 2);
-      if (t !== null && t > 0 && t < hitT) {
-        hitT = t;
+    let hitDist = CFG.GUIDE_LEN;
+    const step = 3;
+
+    // Check intersection with each ball
+    State.balls.forEach(b => {
+      if (b.pocketed || b.id === 0) return;
+      // Ray-circle intersection
+      const bx = b.x - cueBall.x;
+      const by = b.y - cueBall.y;
+      const tca = bx * dx + by * dy;
+      if (tca < 0) return;
+      const d2 = bx * bx + by * by - tca * tca;
+      const minDist2 = (R * 2) * (R * 2);
+      if (d2 > minDist2) return;
+      const thc = Math.sqrt(minDist2 - d2);
+      const t = tca - thc;
+      if (t > 0 && t < hitDist) {
+        hitDist = t;
         hitBall = b;
       }
     });
 
-    // Draw dotted guideline to first obstacle or wall
-    const maxLen = Math.hypot(right - left, bottom - top);
-    const endT = Math.min(hitT, maxLen);
+    // Wall check
+    [
+      // left wall
+      { nx: 1, ny: 0, d: FIELD.x + R - cueBall.x },
+      // right wall
+      { nx: -1, ny: 0, d: cueBall.x - (FIELD.x2 - R) },
+      // top wall
+      { nx: 0, ny: 1, d: FIELD.y + R - cueBall.y },
+      // bottom wall
+      { nx: 0, ny: -1, d: cueBall.y - (FIELD.y2 - R) },
+    ].forEach(wall => {
+      const denom = -(dx * wall.nx + dy * wall.ny);
+      if (denom <= 0) return;
+      const t = wall.d / denom;
+      if (t > 0 && t < hitDist) hitDist = t;
+    });
 
-    ctx.save();
-    ctx.setLineDash([6, 8]);
-    ctx.strokeStyle = 'rgba(255,255,255,.35)';
-    ctx.lineWidth = 1;
-    ctx.shadowColor = 'rgba(0,220,180,.4)';
-    ctx.shadowBlur = 6;
-    ctx.beginPath();
-    ctx.moveTo(x, y);
-    ctx.lineTo(x + vx * endT, y + vy * endT);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.shadowBlur = 0;
+    // Draw dashed line
+    const endX = cueBall.x + dx * hitDist;
+    const endY = cueBall.y + dy * hitDist;
 
-    // Deflected ball path (ghost ball)
+    c.save();
+    c.globalAlpha = 0.55;
+    c.strokeStyle = '#d4af37';
+    c.lineWidth = 1.5;
+    c.setLineDash([6, 8]);
+    c.beginPath();
+    c.moveTo(cueBall.x, cueBall.y);
+    c.lineTo(endX, endY);
+    c.stroke();
+
+    // Ghost cue ball at impact point
+    c.globalAlpha = 0.25;
+    c.setLineDash([]);
+    c.strokeStyle = '#fff';
+    c.lineWidth = 1;
+    c.beginPath();
+    c.arc(endX, endY, R, 0, Math.PI * 2);
+    c.stroke();
+
+    // If hitting a ball, show deflection line
     if (hitBall) {
-      const hx = x + vx * hitT;
-      const hy = y + vy * hitT;
+      const impAngle = Math.atan2(hitBall.y - endY, hitBall.x - endX);
+      const perpAngle = impAngle + Math.PI / 2;
+      const deflectLen = 60;
+      // Deflected ball path
+      c.globalAlpha = 0.3;
+      c.strokeStyle = '#ff9f43';
+      c.lineWidth = 1;
+      c.setLineDash([4, 6]);
+      c.beginPath();
+      c.moveTo(endX + Math.cos(impAngle) * R, endY + Math.sin(impAngle) * R);
+      c.lineTo(
+        endX + Math.cos(impAngle) * (R + deflectLen),
+        endY + Math.sin(impAngle) * (R + deflectLen)
+      );
+      c.stroke();
 
-      // Ghost circle at impact point
-      ctx.globalAlpha = 0.25;
-      ctx.strokeStyle = '#fff';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(hx, hy, r, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // Direction arrow on target ball
-      const nx = (hitBall.x - hx) / (r * 2);
-      const ny = (hitBall.y - hy) / (r * 2);
-      ctx.setLineDash([4, 6]);
-      ctx.strokeStyle = 'rgba(255,200,80,.5)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(hitBall.x, hitBall.y);
-      ctx.lineTo(hitBall.x + nx * 60, hitBall.y + ny * 60);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.globalAlpha = 1;
+      // Ghost target ball
+      c.globalAlpha = 0.2;
+      c.setLineDash([]);
+      c.fillStyle = BALL_COLORS[hitBall.id];
+      c.beginPath();
+      c.arc(
+        endX + Math.cos(impAngle) * R,
+        endY + Math.sin(impAngle) * R,
+        R, 0, Math.PI * 2
+      );
+      c.fill();
     }
 
-    ctx.restore();
+    c.restore();
   }
 
-  // Ray-circle intersection helper
-  function rayCircleIntersect(ox, oy, dx, dy, cx, cy, r) {
-    const fx = ox - cx, fy = oy - cy;
-    const a = dx*dx + dy*dy;
-    const b = 2 * (fx*dx + fy*dy);
-    const c = fx*fx + fy*fy - r*r;
-    const disc = b*b - 4*a*c;
-    if (disc < 0) return null;
-    const t = (-b - Math.sqrt(disc)) / (2 * a);
-    return t > 1 ? t : null;
-  }
-
-  // ── Balls ──────────────────────────────────────────
-  function drawBalls(balls) {
-    // Draw shadows first
-    balls.forEach(ball => {
-      if (ball.pocketed) return;
-      ctx.fillStyle = 'rgba(0,0,0,.35)';
-      ctx.beginPath();
-      ctx.ellipse(ball.x + 3, ball.y + 4, CFG.BALL_RADIUS, CFG.BALL_RADIUS * 0.5, 0, 0, Math.PI * 2);
-      ctx.fill();
-    });
-
-    // Draw each ball
-    balls.forEach(ball => {
-      if (ball.pocketed) return;
-      drawBall(ball);
-    });
-  }
-
-  // Draw a single ball with glossy 3D effect
-  function drawBall(ball) {
-    const r = CFG.BALL_RADIUS;
-    const { x, y, number } = ball;
-
-    ctx.save();
-    ctx.translate(x, y);
-
-    if (number === 0) {
-      // ── Cue ball ──
-      const grad = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.05, 0, 0, r);
-      grad.addColorStop(0, '#ffffff');
-      grad.addColorStop(0.45, '#f0ece4');
-      grad.addColorStop(1, '#c8c0b4');
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(0, 0, r, 0, Math.PI * 2);
-      ctx.fill();
-    } else {
-      const info = BALL_COLORS[number];
-      const color = info.color;
-
-      if (info.solid) {
-        // ── Solid ball ──
-        const grad = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.05, 0, 0, r);
-        grad.addColorStop(0, lightenColor(color, 60));
-        grad.addColorStop(0.4, color);
-        grad.addColorStop(1, darkenColor(color, 50));
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(0, 0, r, 0, Math.PI * 2);
-        ctx.fill();
-      } else {
-        // ── Stripe ball — white base + colour stripe ──
-        const base = ctx.createRadialGradient(-r*0.3, -r*0.35, r*0.05, 0, 0, r);
-        base.addColorStop(0, '#fff');
-        base.addColorStop(0.5, '#f0ece4');
-        base.addColorStop(1, '#c0b8b0');
-        ctx.fillStyle = base;
-        ctx.beginPath();
-        ctx.arc(0, 0, r, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Stripe clip
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(0, 0, r, 0, Math.PI * 2);
-        ctx.clip();
-        const sg = ctx.createLinearGradient(0, -r * 0.45, 0, r * 0.45);
-        sg.addColorStop(0, lightenColor(color, 40));
-        sg.addColorStop(0.5, color);
-        sg.addColorStop(1, darkenColor(color, 30));
-        ctx.fillStyle = sg;
-        ctx.fillRect(-r, -r * 0.45, r * 2, r * 0.9);
-        ctx.restore();
-      }
-
-      // Number label
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(0, 0, r * 0.38, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(255,255,255,.92)';
-      ctx.fill();
-      ctx.fillStyle = number === 8 ? '#fff' : '#1a1a1a';
-      ctx.font = `bold ${r * 0.5}px Rajdhani, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(number, 0, 0.5);
-      ctx.restore();
-    }
-
-    // Gloss highlight
-    const gloss = ctx.createRadialGradient(-r * 0.3, -r * 0.42, 0, -r * 0.1, -r * 0.25, r * 0.65);
-    gloss.addColorStop(0, 'rgba(255,255,255,.55)');
-    gloss.addColorStop(0.5, 'rgba(255,255,255,.1)');
-    gloss.addColorStop(1, 'transparent');
-    ctx.fillStyle = gloss;
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.restore();
-  }
-
-  // ── Cue Stick ──────────────────────────────────────
-  function drawCue(cueBall, aim, cueState) {
+  /* ── Draw cue stick ───────────────────────────────────────── */
+  function drawCue(c, cueBall, angle, power) {
     if (!cueBall || cueBall.pocketed) return;
 
-    const angle = aim.angle;
-    const power = aim.power; // 0..1
+    const R = CFG.BALL_R;
+    const pullback = power * 35 + 5; // how far the cue is pulled back
+    const cueLen = CFG.CUE_LEN;
 
-    // Offset cue from ball based on drag distance (pull-back animation)
-    const pullback = 10 + power * 60;
-    const tipX = cueBall.x - Math.cos(angle) * (CFG.BALL_RADIUS + 4 + pullback * 0.1);
-    const tipY = cueBall.y - Math.sin(angle) * (CFG.BALL_RADIUS + 4 + pullback * 0.1);
-    const cueLen = 240;
-    const tailX = tipX - Math.cos(angle) * cueLen;
-    const tailY = tipY - Math.sin(angle) * cueLen;
+    // Start of cue tip (at ball + small gap)
+    const tipGap = R + 4 + pullback;
+    const tipX = cueBall.x - Math.cos(angle) * tipGap;
+    const tipY = cueBall.y - Math.sin(angle) * tipGap;
 
-    ctx.save();
-    ctx.shadowColor = 'rgba(0,0,0,.7)';
-    ctx.shadowBlur = 12;
-    ctx.shadowOffsetX = 4;
-    ctx.shadowOffsetY = 4;
+    // End of cue (butt)
+    const buttX = cueBall.x - Math.cos(angle) * (tipGap + cueLen);
+    const buttY = cueBall.y - Math.sin(angle) * (tipGap + cueLen);
 
-    // Cue body gradient (tapered stick)
-    const grad = ctx.createLinearGradient(tipX, tipY, tailX, tailY);
-    grad.addColorStop(0,   '#f0d090');  // tip — lighter maple
-    grad.addColorStop(0.3, '#c8922a');  // shaft
-    grad.addColorStop(0.7, '#7a4520');  // butt
-    grad.addColorStop(1,   '#3d2010');  // grip
+    c.save();
 
-    ctx.lineCap = 'round';
+    // Cue shadow
+    c.globalAlpha = 0.25;
+    c.strokeStyle = '#000';
+    c.lineWidth = 11;
+    c.lineCap = 'round';
+    c.beginPath();
+    c.moveTo(tipX + 2, tipY + 3);
+    c.lineTo(buttX + 2, buttY + 3);
+    c.stroke();
 
-    // Taper: draw as thin-to-thick using multiple segments
-    for (let i = 0; i <= 20; i++) {
-      const t0 = i / 20;
-      const t1 = (i + 1) / 20;
-      const w = 1.5 + t0 * 6.5;
-      ctx.strokeStyle = grad;
-      ctx.lineWidth = w;
-      ctx.beginPath();
-      ctx.moveTo(tipX + (tailX - tipX) * t0, tipY + (tailY - tipY) * t0);
-      ctx.lineTo(tipX + (tailX - tipX) * t1, tipY + (tailY - tipY) * t1);
-      ctx.stroke();
+    c.globalAlpha = 1;
+
+    // Cue body gradient (tip to butt: thin to thick, light to dark wood)
+    const cueGrad = c.createLinearGradient(tipX, tipY, buttX, buttY);
+    cueGrad.addColorStop(0,    '#e8d09a'); // tip — light
+    cueGrad.addColorStop(0.12, '#c4a85a'); // shaft
+    cueGrad.addColorStop(0.45, '#8a5a20'); // middle
+    cueGrad.addColorStop(0.7,  '#6a3a10'); // wrap area
+    cueGrad.addColorStop(0.85, '#4a2208'); // butt
+    cueGrad.addColorStop(1,    '#2a1208');
+
+    // Draw the cue as tapered line
+    c.lineCap = 'round';
+    // Thin part (shaft)
+    c.strokeStyle = cueGrad;
+    c.lineWidth = 5;
+    c.beginPath();
+    c.moveTo(tipX, tipY);
+    c.lineTo(tipX + (buttX - tipX) * 0.5, tipY + (buttY - tipY) * 0.5);
+    c.stroke();
+
+    // Thick part (butt)
+    c.lineWidth = 10;
+    c.beginPath();
+    c.moveTo(tipX + (buttX - tipX) * 0.5, tipY + (buttY - tipY) * 0.5);
+    c.lineTo(buttX, buttY);
+    c.stroke();
+
+    // Cue highlight
+    c.globalAlpha = 0.25;
+    c.strokeStyle = 'rgba(255,240,180,0.6)';
+    c.lineWidth = 2;
+    c.beginPath();
+    c.moveTo(tipX - Math.sin(angle) * 1, tipY + Math.cos(angle) * 1);
+    c.lineTo(buttX - Math.sin(angle) * 2, buttY + Math.cos(angle) * 2);
+    c.stroke();
+
+    // Blue chalk tip
+    c.globalAlpha = 1;
+    c.fillStyle = '#4a90c8';
+    c.beginPath();
+    c.arc(tipX, tipY, 3, 0, Math.PI * 2);
+    c.fill();
+
+    c.restore();
+  }
+
+  /* ── Pocket flash effect ──────────────────────────────────── */
+  function drawPocketFlashes(c) {
+    State.pocketFlash = State.pocketFlash.filter(f => f.t > 0);
+    State.pocketFlash.forEach(f => {
+      c.save();
+      c.globalAlpha = f.t * 0.6;
+      c.fillStyle = `rgba(201,168,76,${f.t})`;
+      c.beginPath();
+      c.arc(f.x, f.y, CFG.POCKET_R * (2 - f.t), 0, Math.PI * 2);
+      c.fill();
+      c.restore();
+      f.t -= 0.03;
+    });
+  }
+
+  /* ── Place cue ball indicator ─────────────────────────────── */
+  function drawCueBallPlacement(c, mx, my) {
+    if (!State.awaitingCueBall) return;
+    const R = CFG.BALL_R;
+    const valid = isValidCuePlacement(mx, my);
+    c.save();
+    c.globalAlpha = 0.6;
+    c.strokeStyle = valid ? '#2ecc71' : '#e74c3c';
+    c.lineWidth = 2;
+    c.setLineDash([4, 4]);
+    c.beginPath();
+    c.arc(mx, my, R, 0, Math.PI * 2);
+    c.stroke();
+    c.setLineDash([]);
+    c.restore();
+  }
+
+  /* ── Main render call ─────────────────────────────────────── */
+  function render(state, mousePos) {
+    if (!ctx) return;
+    // Clear
+    ctx.clearRect(0, 0, CFG.TABLE_W, CFG.TABLE_H);
+    // Draw cached table
+    ctx.drawImage(offscreen, 0, 0);
+
+    // Pocket flashes
+    drawPocketFlashes(ctx);
+
+    const cueBall = state.balls.find(b => b.id === 0);
+
+    // Aim guide (only when mouse held and not moving)
+    if (!state.ballsMoving && !state.awaitingCueBall && state.dragStart && state.dragCurrent && cueBall && !cueBall.pocketed) {
+      drawAimGuide(ctx, cueBall, state.aimAngle);
+      drawCue(ctx, cueBall, state.aimAngle, state.power);
+    } else if (!state.ballsMoving && !state.awaitingCueBall && !state.aiThinking && cueBall && !cueBall.pocketed && mousePos) {
+      // Show idle cue following mouse when not dragging
+      const angle = Math.atan2(mousePos.y - cueBall.y, mousePos.x - cueBall.x) + Math.PI;
+      drawAimGuide(ctx, cueBall, angle + Math.PI);
+      drawCue(ctx, cueBall, angle + Math.PI, 0.05);
     }
 
-    // Ferrule (white ring near tip)
-    ctx.fillStyle = '#e8e0d0';
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = '#bbb';
-    ctx.shadowBlur = 0;
-    const ferX = tipX + Math.cos(angle) * (-1) * (-20);
-    const ferY = tipY + Math.sin(angle) * (-1) * (-20);
-    ctx.save();
-    ctx.translate(tipX - Math.cos(angle) * 18, tipY - Math.sin(angle) * 18);
-    ctx.rotate(angle + Math.PI / 2);
-    ctx.beginPath();
-    ctx.rect(-2, -3, 4, 6);
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
+    // Cue ball placement
+    if (state.awaitingCueBall && mousePos) {
+      drawCueBallPlacement(ctx, mousePos.x, mousePos.y);
+    }
 
-    // Wrap bands on butt
-    [0.72, 0.76, 0.80].forEach(t => {
-      const bx = tipX + (tailX - tipX) * t;
-      const by = tipY + (tailY - tipY) * t;
-      ctx.save();
-      ctx.translate(bx, by);
-      ctx.rotate(angle + Math.PI / 2);
-      ctx.strokeStyle = 'rgba(0,0,0,.4)';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(-5, 0);
-      ctx.lineTo(5, 0);
-      ctx.stroke();
-      ctx.restore();
-    });
-
-    ctx.restore();
+    // Balls (draw non-cue first, then cue on top)
+    state.balls.forEach(b => { if (b.id !== 0) drawBall(ctx, b); });
+    const cb = state.balls.find(b => b.id === 0);
+    if (cb) drawBall(ctx, cb);
   }
 
-  // ── Colour utilities ───────────────────────────────
-  function lightenColor(hex, amt) {
-    const r = Math.min(255, parseInt(hex.slice(1,3),16) + amt);
-    const g = Math.min(255, parseInt(hex.slice(3,5),16) + amt);
-    const b = Math.min(255, parseInt(hex.slice(5,7),16) + amt);
-    return `rgb(${r},${g},${b})`;
+  /* ── Color helpers ─────────────────────────────────────────── */
+  function lightenColor(hex, amount) {
+    return adjustColor(hex, amount);
   }
-  function darkenColor(hex, amt) {
-    const r = Math.max(0, parseInt(hex.slice(1,3),16) - amt);
-    const g = Math.max(0, parseInt(hex.slice(3,5),16) - amt);
-    const b = Math.max(0, parseInt(hex.slice(5,7),16) - amt);
+  function darkenColor(hex, amount) {
+    return adjustColor(hex, -amount);
+  }
+  function adjustColor(hex, amount) {
+    const r = Math.min(255, Math.max(0, parseInt(hex.slice(1, 3), 16) + amount));
+    const g = Math.min(255, Math.max(0, parseInt(hex.slice(3, 5), 16) + amount));
+    const b = Math.min(255, Math.max(0, parseInt(hex.slice(5, 7), 16) + amount));
     return `rgb(${r},${g},${b})`;
   }
 
-  // ── roundRect helpers ──────────────────────────────
-  function roundRectPath(x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + w - r, y);
-    ctx.arcTo(x + w, y, x + w, y + r, r);
-    ctx.lineTo(x + w, y + h - r);
-    ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
-    ctx.lineTo(x + r, y + h);
-    ctx.arcTo(x, y + h, x, y + h - r, r);
-    ctx.lineTo(x, y + r);
-    ctx.arcTo(x, y, x + r, y, r);
-    ctx.closePath();
-  }
-  function roundRect(x, y, w, h, r, fill) {
-    roundRectPath(x, y, w, h, r);
-    ctx.fillStyle = fill;
-    ctx.fill();
-  }
+  function getCanvas() { return canvas; }
+  function getCtx() { return ctx; }
 
-  function resize() {
-    canvas.width  = window.innerWidth;
-    canvas.height = window.innerHeight;
-  }
-
-  return { init, draw, resize };
+  return { init, render, getCanvas, getCtx };
 })();
 
+/* ══════════════════════════════════════════════════════════════
+   § 7. GAME RULES ENGINE
+══════════════════════════════════════════════════════════════ */
+const Rules = (() => {
 
-/* ══════════════════════════════════════════════════════
-   § GAME STATE & LOGIC
-   Manages turns, rules, win/lose, ball rack
-══════════════════════════════════════════════════════ */
-const Game = (() => {
+  /** Evaluate what happened after balls stopped rolling */
+  function evaluate(pocketedThisTurn) {
+    const cp = State.currentPlayer;
+    const op = 1 - cp;
 
-  let state = {};
-
-  // ── Table geometry (recalculated on resize) ────────
-  function makeTable(W, H) {
-    const railW = Math.min(W, H) * 0.045;
-    // Table is 2:1 ratio, centred, with slight downward offset
-    const tW = Math.min(W * 0.82, H * 1.6);
-    const tH = tW * 0.5;
-    const left   = (W - tW) / 2;
-    const top    = (H - tH) / 2 + H * 0.02;
-    const right  = left + tW;
-    const bottom = top  + tH;
-    const mx = (left + right) / 2;
-    const my = (top + bottom) / 2;
-
-    const pockets = [
-      { x: left,  y: top    },
-      { x: mx,    y: top    },
-      { x: right, y: top    },
-      { x: left,  y: bottom },
-      { x: mx,    y: bottom },
-      { x: right, y: bottom },
-    ];
-
-    return { left, top, right, bottom, railW, pockets, tW, tH };
-  }
-
-  // ── Ball factory ───────────────────────────────────
-  function makeBall(number, x, y) {
-    return { number, x, y, vx: 0, vy: 0, pocketed: false, spin: 0 };
-  }
-
-  // ── Standard triangle rack ─────────────────────────
-  function rackBalls(table) {
-    const r = CFG.BALL_RADIUS;
-    const { left, right, top, bottom } = table;
-    // Foot spot: 3/4 down the table
-    const footX = left + (right - left) * 0.75;
-    const footY = (top + bottom) / 2;
-    const spacing = r * 2 + 0.3;
-
-    // Standard 8-ball rack order
-    const order = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-    // Ensure 8 is in middle (row 2, pos 1)  and corners are one solid + one stripe
-    const rackOrder = [1, 9, 7, 12, 4, 14, 2, 8, 10, 6, 15, 3, 11, 13, 5];
-
-    const positions = [];
-    let idx = 0;
-    for (let row = 0; row < 5; row++) {
-      for (let col = 0; col <= row; col++) {
-        positions.push({
-          x: footX + row * spacing * Math.cos(0) - col * spacing * 0.5 * 2 / 2,
-          y: footY + col * spacing - row * spacing * 0.5,
-        });
-      }
-    }
-
-    // Re-derive: standard triangle
-    const balls = [];
-    let ballIdx = 0;
-    for (let row = 0; row < 5; row++) {
-      for (let col = 0; col <= row; col++) {
-        const bx = footX + row * spacing;
-        const by = footY + (col - row / 2) * spacing;
-        balls.push(makeBall(rackOrder[ballIdx++], bx, by));
-      }
-    }
-    return balls;
-  }
-
-  // ── Initialise / reset game ────────────────────────
-  function init(canvas) {
-    const W = canvas.width, H = canvas.height;
-    const table = makeTable(W, H);
-    const { left, right, top, bottom } = table;
-
-    // Cue ball starts on the left quarter
-    const cueBallX = left + (right - left) * 0.22;
-    const cueBallY = (top + bottom) / 2;
-    const cueBall = makeBall(0, cueBallX, cueBallY);
-
-    const objectBalls = rackBalls(table);
-    const balls = [cueBall, ...objectBalls];
-
-    state = {
-      table,
-      balls,
-      currentPlayer: 0,           // 0 or 1
-      playerTypes: [null, null],   // 'solid' | 'stripe' | null
-      playerScores: [0, 0],
-      pottedThisTurn: [],
-      shooting: false,             // true while balls are moving
-      gameOver: false,
-      winner: -1,
-      winReason: '',
-      foulPending: false,
-      scratchPending: false,
-      aim: {
-        dragging: false,
-        angle: 0,
-        power: 0,
-        startX: 0,
-        startY: 0,
-        showLine: false,
-      },
-      cueState: { visible: true },
-    };
-
-    return state;
-  }
-
-  // ── Recalculate table on window resize ────────────
-  function resize(canvas) {
-    if (!state.table) return;
-    const W = canvas.width, H = canvas.height;
-    const oldT = state.table;
-    const newT = makeTable(W, H);
-    // Remap ball positions proportionally
-    const sx = (newT.right - newT.left) / (oldT.right - oldT.left);
-    const sy = (newT.bottom - newT.top) / (oldT.bottom - oldT.top);
-    state.balls.forEach(b => {
-      b.x = newT.left + (b.x - oldT.left) * sx;
-      b.y = newT.top  + (b.y - oldT.top)  * sy;
-    });
-    state.table = newT;
-  }
-
-  // ── Shoot the cue ball ─────────────────────────────
-  function shoot(angle, power) {
-    const cue = state.balls[0];
-    if (!cue || cue.pocketed || state.shooting || state.gameOver) return;
-    const speed = power * CFG.MAX_SHOT_POWER;
-    cue.vx = Math.cos(angle) * speed;
-    cue.vy = Math.sin(angle) * speed;
-    state.shooting = true;
-    state.pottedThisTurn = [];
-    state.foulPending = false;
-    state.scratchPending = false;
-    Audio.playCueHit(power);
-  }
-
-  // ── Per-frame physics update ───────────────────────
-  function update() {
-    if (!state.shooting) return;
-
-    const pocketed = Physics.step(state.balls, state.table);
-
-    // Handle balls potted this frame
-    pocketed.forEach(ball => {
-      if (ball.number === 0) {
-        // Cue ball scratched
-        state.scratchPending = true;
-      } else {
-        state.pottedThisTurn.push(ball);
-      }
-    });
-
-    // Check if all balls at rest
-    if (Physics.isAtRest(state.balls)) {
-      state.shooting = false;
-      endTurn();
-    }
-  }
-
-  // ── End of turn logic ──────────────────────────────
-  function endTurn() {
-    const cur = state.currentPlayer;
-    const other = 1 - cur;
-    const potted = state.pottedThisTurn;
     let foul = false;
-    let changeTurn = true;
+    let foulReason = '';
+    let switchTurn = true;
 
-    // === Scratch (cue ball pocketed) ===
-    if (state.scratchPending) {
-      foul = true;
-      // Respawn cue ball in D area
-      respawnCueBall();
+    const cuePocketed = pocketedThisTurn.some(p => p.ball.id === 0);
+    const eightPocketed = pocketedThisTurn.some(p => p.ball.id === 8);
+    const otherPocketed = pocketedThisTurn.filter(p => p.ball.id !== 0 && p.ball.id !== 8);
+
+    // ── 8-ball scenarios ───────────────────────────────────────
+    if (eightPocketed) {
+      // Winning: player must have cleared all their balls first
+      const cpBallsRemain = getBallsOnTable(cp);
+      if (cpBallsRemain.length === 0 && !cuePocketed) {
+        // Win!
+        endGame(cp, 'Pocketed the 8-ball correctly! 🎱');
+        return;
+      } else {
+        // Loss: pocketed 8 too early or scratched
+        endGame(op, cuePocketed ? 'Opponent scratched on the 8-ball!' : 'Pocketed 8-ball too early!');
+        return;
+      }
     }
 
-    // === 8-ball rules ===
-    const eight = potted.find(b => b.number === 8);
-    if (eight) {
-      const { playerTypes } = state;
-      const myType = playerTypes[cur];
-      // Player must have cleared all their balls to legally pot the 8
-      const myBalls = state.balls.filter(b => !b.pocketed && b.number !== 8 && b.number !== 0);
-      const mySolids = myBalls.filter(b => BALL_COLORS[b.number].solid);
-      const myStripes = myBalls.filter(b => !BALL_COLORS[b.number].solid);
-
-      const myGroupCleared =
-        (myType === 'solid'  && mySolids.length === 0) ||
-        (myType === 'stripe' && myStripes.length === 0) ||
-        myType === null;
-
-      if (myGroupCleared && !foul) {
-        endGame(cur, 'Sank the 8-ball!');
-      } else {
-        endGame(other, foul ? 'Opponent scratched on the 8-ball!' : 'Potted 8-ball early!');
+    // ── Scratch (cue ball pocketed) ────────────────────────────
+    if (cuePocketed) {
+      foul = true;
+      foulReason = '⚠ Scratch! Cue ball in pocket.';
+      State.awaitingCueBall = true;
+      // Re-create the cue ball (will be placed by player)
+      const existing = State.balls.find(b => b.id === 0);
+      if (existing) {
+        existing.pocketed = false;
+        existing.x = FIELD.x + FIELD.w * 0.25;
+        existing.y = FIELD.y + FIELD.h / 2;
+        existing.vx = 0; existing.vy = 0;
       }
+    }
+
+    // ── Assign ball types on first pocket ──────────────────────
+    if (!State.typesAssigned && otherPocketed.length > 0) {
+      const firstId = otherPocketed[0].ball.id;
+      const cpType = firstId <= 7 ? 'solid' : 'stripe';
+      const opType = cpType === 'solid' ? 'stripe' : 'solid';
+      State.playerTypes[cp] = cpType;
+      State.playerTypes[op] = opType;
+      State.typesAssigned = true;
+      updateBallTypeUI();
+    }
+
+    // ── Check if pocketed correct balls ───────────────────────
+    if (!foul && State.typesAssigned && otherPocketed.length > 0) {
+      const cpType = State.playerTypes[cp];
+      const correctPocketed = otherPocketed.filter(p => {
+        return cpType === 'solid' ? p.ball.id >= 1 && p.ball.id <= 7
+                                  : p.ball.id >= 9 && p.ball.id <= 15;
+      });
+      if (correctPocketed.length > 0 && !foul) {
+        switchTurn = false; // Extra turn for pocketing correct balls
+      }
+    }
+
+    // Switch turns or continue
+    if (foul || switchTurn) {
+      State.currentPlayer = op;
+    }
+
+    showFoulMessage(foulReason);
+    updateTurnUI();
+    State.pocketedThisTurn = [];
+
+    // Trigger AI if it's AI's turn
+    if (State.vsAI && State.currentPlayer === 1 && !State.awaitingCueBall) {
+      scheduleAIShot();
+    }
+  }
+
+  /** Get balls belonging to a player still on table */
+  function getBallsOnTable(playerIdx) {
+    const type = State.playerTypes[playerIdx];
+    if (!type) return [];
+    return State.balls.filter(b => {
+      if (b.pocketed) return false;
+      if (type === 'solid')  return b.id >= 1 && b.id <= 7;
+      if (type === 'stripe') return b.id >= 9 && b.id <= 15;
+      return false;
+    });
+  }
+
+  function endGame(winner, reason) {
+    State.winner = winner;
+    State.winReason = reason;
+    State.screen = 'gameover';
+    showGameOver(winner, reason);
+  }
+
+  return { evaluate, getBallsOnTable };
+})();
+
+/* ══════════════════════════════════════════════════════════════
+   § 8. AI OPPONENT
+══════════════════════════════════════════════════════════════ */
+const AI = (() => {
+
+  function scheduleShot() {
+    if (State.aiTimer) clearTimeout(State.aiTimer);
+    State.aiThinking = true;
+    updateStatusMsg('🤖 AI is thinking...');
+
+    State.aiTimer = setTimeout(() => {
+      takeShot();
+      State.aiThinking = false;
+    }, CFG.AI_THINK_MS + Math.random() * 400);
+  }
+
+  function takeShot() {
+    const cueBall = State.balls.find(b => b.id === 0);
+    if (!cueBall || cueBall.pocketed) return;
+
+    // Find the best target ball for the AI
+    const target = findBestTarget(cueBall);
+    if (!target) {
+      // No clear shot, play defensive (aim randomly-ish)
+      const angle = Math.random() * Math.PI * 2;
+      const power = 0.3 + Math.random() * 0.3;
+      Physics.shootCue(angle, power);
+      endAITurn();
       return;
     }
 
-    // === Assign ball types on first legal pot ===
-    const legalPotted = potted.filter(b => b.number !== 0 && b.number !== 8);
-    if (state.playerTypes[0] === null && legalPotted.length > 0 && !foul) {
-      const firstType = BALL_COLORS[legalPotted[0].number].solid ? 'solid' : 'stripe';
-      state.playerTypes[cur]   = firstType;
-      state.playerTypes[other] = firstType === 'solid' ? 'stripe' : 'solid';
+    // Angle from cue to target
+    let angle = Math.atan2(target.y - cueBall.y, target.x - cueBall.x);
+    // Add inaccuracy
+    const err = (1 - CFG.AI_ACCURACY) * (Math.random() - 0.5) * 0.4;
+    angle += err;
+
+    const power = 0.45 + Math.random() * 0.35;
+    Physics.shootCue(angle, power);
+    endAITurn();
+  }
+
+  function findBestTarget(cueBall) {
+    const aiType = State.playerTypes[1];
+    let candidates = [];
+
+    if (!State.typesAssigned) {
+      // Pick any non-8 ball closest to a pocket
+      candidates = State.balls.filter(b => !b.pocketed && b.id !== 0 && b.id !== 8);
+    } else if (aiType === 'solid') {
+      candidates = State.balls.filter(b => !b.pocketed && b.id >= 1 && b.id <= 7);
+    } else {
+      candidates = State.balls.filter(b => !b.pocketed && b.id >= 9 && b.id <= 15);
     }
 
-    // === Score potted balls ===
-    legalPotted.forEach(ball => {
-      const type = BALL_COLORS[ball.number].solid ? 'solid' : 'stripe';
-      const owner = state.playerTypes[0] === type ? 0 : 1;
-      if (owner === cur && !foul) {
-        state.playerScores[cur]++;
-      }
-    });
+    // Also consider the 8-ball if all our balls are cleared
+    const myBallsLeft = Rules.getBallsOnTable(1).length;
+    if (myBallsLeft === 0) {
+      const eight = State.balls.find(b => b.id === 8 && !b.pocketed);
+      if (eight) candidates = [eight];
+    }
 
-    // === Continue turn if potted own balls (no foul) ===
-    if (!foul && legalPotted.length > 0) {
-      // Check if potted correct type or if types not yet assigned
-      const cur_type = state.playerTypes[cur];
-      const pottedCorrect = legalPotted.some(b => {
-        const bt = BALL_COLORS[b.number].solid ? 'solid' : 'stripe';
-        return cur_type === null || bt === cur_type;
+    if (candidates.length === 0) return null;
+
+    // Score each candidate by (proximity to pocket + shot angle clarity)
+    const POCKETS = Physics.POCKETS;
+    let best = null;
+    let bestScore = Infinity;
+
+    candidates.forEach(ball => {
+      // Find best pocket for this ball
+      POCKETS.forEach(pocket => {
+        const ballToPocket = Math.hypot(ball.x - pocket.x, ball.y - pocket.y);
+        const cueToball = Math.hypot(ball.x - cueBall.x, ball.y - cueBall.y);
+        const score = ballToPocket + cueToball * 0.4;
+        if (score < bestScore) {
+          bestScore = score;
+          best = ball;
+        }
       });
-      if (pottedCorrect) changeTurn = false;
-    }
-
-    if (foul) {
-      state.foulPending = true;
-      changeTurn = true;
-    }
-
-    if (changeTurn) {
-      state.currentPlayer = other;
-    }
-
-    // Respawn cue if it was pocketed
-    if (state.scratchPending) {
-      state.scratchPending = false;
-    }
-  }
-
-  // ── Respawn cue ball (after scratch) ──────────────
-  function respawnCueBall() {
-    const { left, right, top, bottom } = state.table;
-    const cue = state.balls[0];
-    cue.pocketed = false;
-    cue.vx = 0; cue.vy = 0;
-    // Place in baulk area (D)
-    cue.x = left + (right - left) * 0.22 + (Math.random() - .5) * 40;
-    cue.y = (top + bottom) / 2 + (Math.random() - .5) * 30;
-    // Make sure not overlapping any ball
-    state.balls.forEach(b => {
-      if (b === cue || b.pocketed) return;
-      while (Vec.dist(cue, b) < CFG.BALL_RADIUS * 2.2) {
-        cue.x += 5;
-      }
     });
+
+    return best;
   }
 
-  // ── End game ───────────────────────────────────────
-  function endGame(winner, reason) {
-    state.gameOver = true;
-    state.winner = winner;
-    state.winReason = reason;
-    Audio.playWin();
+  function endAITurn() {
+    // Turn switching handled by Rules after balls stop
   }
 
-  function getState() { return state; }
-
-  return { init, resize, shoot, update, getState, respawnCueBall };
+  return { scheduleShot };
 })();
 
+/* expose for Rules */
+function scheduleAIShot() { AI.scheduleShot(); }
 
-/* ══════════════════════════════════════════════════════
-   § UI MODULE
-   Updates DOM elements from game state
-══════════════════════════════════════════════════════ */
-const UI = (() => {
-  const $ = id => document.getElementById(id);
-
-  const els = {
-    startScreen:    $('startScreen'),
-    gameOverScreen: $('gameOverScreen'),
-    gameUI:         $('gameUI'),
-    startBtn:       $('startBtn'),
-    howToBtn:       $('howToBtn'),
-    howtoPanel:     $('howtoPanel'),
-    playAgainBtn:   $('playAgainBtn'),
-    mainMenuBtn:    $('mainMenuBtn'),
-    soundToggleStart: $('soundToggleStart'),
-    soundToggleGame:  $('soundToggleGame'),
-    p1Panel:    $('p1Panel'),
-    p2Panel:    $('p2Panel'),
-    p1Type:     $('p1Type'),
-    p2Type:     $('p2Type'),
-    p1Rack:     $('p1Rack'),
-    p2Rack:     $('p2Rack'),
-    p1Score:    $('p1Score'),
-    p2Score:    $('p2Score'),
-    turnIndicator: $('turnIndicator'),
-    foulMsg:       $('foulMsg'),
-    powerWrap:     $('powerWrap'),
-    powerFill:     $('powerFill'),
-    winnerTitle:   $('winnerTitle'),
-    winnerReason:  $('winnerReason'),
-    finalScores:   $('finalScores'),
-    shootHint:     $('shootHint'),
-  };
-
-  function showScreen(name) {
-    ['startScreen','gameOverScreen'].forEach(id => {
-      const el = $(id);
-      el.classList.remove('active');
-    });
-    if (name) $(name).classList.add('active');
-    els.gameUI.classList.toggle('hidden', name !== null);
-  }
-
-  function showGame() {
-    els.startScreen.classList.remove('active');
-    els.gameOverScreen.classList.remove('active');
-    els.gameUI.classList.remove('hidden');
-  }
-
-  // ── Ball rack display ──────────────────────────────
-  function makeRackBalls(playerIdx, state) {
-    const { playerTypes, balls } = state;
-    const type = playerTypes[playerIdx];
-    const rack = playerIdx === 0 ? els.p1Rack : els.p2Rack;
-    rack.innerHTML = '';
-
-    if (!type) return;
-
-    // Get all balls of player's type
-    const myNumbers = Object.entries(BALL_COLORS)
-      .filter(([n, info]) => {
-        return type === 'solid' ? info.solid : !info.solid;
-      })
-      .map(([n]) => parseInt(n));
-
-    myNumbers.forEach(num => {
-      const div = document.createElement('div');
-      div.className = 'rack-ball';
-      div.style.background = BALL_COLORS[num].color;
-      const ball = balls.find(b => b.number === num);
-      if (ball && ball.pocketed) div.classList.add('potted');
-      rack.appendChild(div);
-    });
-  }
-
-  // ── Update HUD ─────────────────────────────────────
-  function update(state) {
-    if (!state || state.gameOver) return;
-
-    const { currentPlayer, playerTypes, playerScores, foulPending, aim, shooting } = state;
-
-    // Active player highlight
-    els.p1Panel.classList.toggle('active', currentPlayer === 0 && !shooting);
-    els.p2Panel.classList.toggle('active', currentPlayer === 1 && !shooting);
-
-    // Turn label
-    const names = ['PLAYER 1', 'PLAYER 2'];
-    els.turnIndicator.textContent = shooting
-      ? '...'
-      : `${names[currentPlayer]}'S TURN`;
-
-    // Foul message
-    if (foulPending) {
-      els.foulMsg.textContent = '⚠ FOUL — FREE PLACEMENT';
-      setTimeout(() => { els.foulMsg.textContent = ''; }, 3000);
-      state.foulPending = false;
-    }
-
-    // Types
-    const typeLabel = t => t === 'solid' ? '● SOLIDS' : t === 'stripe' ? '◑ STRIPES' : '—';
-    els.p1Type.textContent = typeLabel(playerTypes[0]);
-    els.p2Type.textContent = typeLabel(playerTypes[1]);
-
-    // Scores
-    els.p1Score.textContent = playerScores[0];
-    els.p2Score.textContent = playerScores[1];
-
-    // Racks
-    makeRackBalls(0, state);
-    makeRackBalls(1, state);
-
-    // Power bar
-    const showPower = aim.dragging;
-    els.powerWrap.classList.toggle('visible', showPower);
-    if (showPower) {
-      const pct = Math.round(aim.power * 100);
-      els.powerFill.style.height = pct + '%';
-      const hue = 120 - aim.power * 120;
-      els.powerFill.style.background = `hsl(${hue},90%,55%)`;
-    }
-  }
-
-  function showGameOver(state) {
-    const names = ['Player 1', 'Player 2'];
-    els.winnerTitle.textContent = `${names[state.winner].toUpperCase()} WINS!`;
-    els.winnerReason.textContent = state.winReason;
-    els.finalScores.innerHTML =
-      `<span>P1: ${state.playerScores[0]} balls</span>` +
-      `<span>P2: ${state.playerScores[1]} balls</span>`;
-    showScreen('gameOverScreen');
-  }
-
-  function updateSoundButton(muted) {
-    const label = muted ? '🔇 SOUND OFF' : '🔊 SOUND ON';
-    els.soundToggleStart.innerHTML = `<span>${muted ? '🔇' : '🔊'}</span><span class="sound-label">${muted ? 'SOUND OFF' : 'SOUND ON'}</span>`;
-    els.soundToggleGame.textContent = muted ? '🔇' : '🔊';
-    els.soundToggleStart.classList.toggle('muted', muted);
-    els.soundToggleGame.classList.toggle('muted', muted);
-  }
-
-  return { els, showScreen, showGame, update, showGameOver, updateSoundButton };
-})();
-
-
-/* ══════════════════════════════════════════════════════
-   § INPUT MODULE
-   Mouse / touch handling for aim & shoot
-══════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════
+   § 9. INPUT HANDLING
+══════════════════════════════════════════════════════════════ */
 const Input = (() => {
-
   let canvas;
-  let isDragging = false;
-  let dragStartX = 0, dragStartY = 0;
+  let mousePos = { x: 0, y: 0 };
 
-  function init(c) {
-    canvas = c;
-    canvas.addEventListener('mousedown',  onDown);
-    canvas.addEventListener('mousemove',  onMove);
-    canvas.addEventListener('mouseup',    onUp);
-    canvas.addEventListener('touchstart', e => onDown(e.touches[0]), { passive: true });
-    canvas.addEventListener('touchmove',  e => { e.preventDefault(); onMove(e.touches[0]); }, { passive: false });
-    canvas.addEventListener('touchend',   e => onUp(e.changedTouches[0]));
+  function init(canvasEl) {
+    canvas = canvasEl;
+
+    canvas.addEventListener('mousedown', onMouseDown);
+    canvas.addEventListener('mousemove', onMouseMove);
+    canvas.addEventListener('mouseup',   onMouseUp);
+    canvas.addEventListener('mouseleave', onMouseLeave);
+
+    // Touch support
+    canvas.addEventListener('touchstart', e => { e.preventDefault(); onMouseDown(touchToMouse(e)); }, { passive: false });
+    canvas.addEventListener('touchmove',  e => { e.preventDefault(); onMouseMove(touchToMouse(e)); }, { passive: false });
+    canvas.addEventListener('touchend',   e => { e.preventDefault(); onMouseUp(touchToMouse(e)); }, { passive: false });
   }
 
-  // Convert page coords → canvas coords
-  function toCanvas(e) {
+  function touchToMouse(e) {
+    const t = e.touches[0] || e.changedTouches[0];
+    return { clientX: t.clientX, clientY: t.clientY };
+  }
+
+  /** Convert screen coordinates to canvas coordinates */
+  function toCanvas(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
     return {
-      x: (e.clientX - rect.left) * (canvas.width  / rect.width),
-      y: (e.clientY - rect.top)  * (canvas.height / rect.height),
+      x: (clientX - rect.left) * (CFG.TABLE_W / rect.width),
+      y: (clientY - rect.top)  * (CFG.TABLE_H / rect.height),
     };
   }
 
-  function onDown(e) {
-    const state = Game.getState();
-    if (!state || state.shooting || state.gameOver) return;
-    const cue = state.balls[0];
-    if (!cue || cue.pocketed) return;
+  function onMouseDown(e) {
+    if (State.screen !== 'game') return;
+    if (State.ballsMoving || State.aiThinking) return;
 
-    const pos = toCanvas(e);
-    isDragging = true;
-    dragStartX = pos.x;
-    dragStartY = pos.y;
+    const pos = toCanvas(e.clientX, e.clientY);
 
-    // Initial angle from cue ball to click position
-    state.aim.angle    = Math.atan2(pos.y - cue.y, pos.x - cue.x) + Math.PI;
-    state.aim.dragging = true;
-    state.aim.power    = 0;
-    state.aim.showLine = true;
-  }
-
-  function onMove(e) {
-    if (!isDragging) return;
-    const state = Game.getState();
-    if (!state) return;
-    const cue = state.balls[0];
-    const pos = toCanvas(e);
-
-    // Angle: from cue ball toward initial click, then use drag displacement for power
-    const angle = Math.atan2(dragStartY - cue.y, dragStartX - cue.x);
-    state.aim.angle = angle;
-
-    // Power based on drag distance away from start
-    const dragDist = Math.hypot(pos.x - dragStartX, pos.y - dragStartY);
-    state.aim.power = Math.min(1, dragDist * CFG.CUE_DRAG_SCALE / 80);
-  }
-
-  function onUp(e) {
-    if (!isDragging) return;
-    isDragging = false;
-    const state = Game.getState();
-    if (!state) return;
-    if (state.aim.dragging && state.aim.power > 0.02) {
-      Game.shoot(state.aim.angle, state.aim.power);
+    // Cue ball placement after scratch
+    if (State.awaitingCueBall) {
+      placeCueBall(pos.x, pos.y);
+      return;
     }
-    state.aim.dragging = false;
-    state.aim.power    = 0;
-    state.aim.showLine = false;
+
+    if (State.vsAI && State.currentPlayer === 1) return; // Not player's turn
+
+    const cueBall = State.balls.find(b => b.id === 0);
+    if (!cueBall || cueBall.pocketed) return;
+
+    State.dragStart   = { x: pos.x, y: pos.y };
+    State.dragCurrent = { x: pos.x, y: pos.y };
+    State.shooting    = true;
+
+    // Zoom in on canvas while aiming
+    canvas.classList.add('aiming');
+    updateAimState(pos);
   }
 
-  return { init };
+  function onMouseMove(e) {
+    const pos = toCanvas(e.clientX, e.clientY);
+    mousePos = pos;
+
+    if (!State.shooting) return;
+    State.dragCurrent = pos;
+    updateAimState(pos);
+  }
+
+  function onMouseLeave() {
+    // Keep aiming state
+  }
+
+  function onMouseUp(e) {
+    if (!State.shooting) return;
+    canvas.classList.remove('aiming');
+
+    const pos = toCanvas(e.clientX, e.clientY);
+    State.dragCurrent = pos;
+    updateAimState(pos);
+
+    if (State.power > 0.01) {
+      shoot();
+    }
+
+    State.shooting    = false;
+    State.dragStart   = null;
+    State.dragCurrent = null;
+    State.power       = 0;
+    updatePowerBar(0);
+  }
+
+  function updateAimState(currentPos) {
+    const cueBall = State.balls.find(b => b.id === 0);
+    if (!cueBall) return;
+
+    // The drag direction defines aim: drag AWAY from cue ball = aiming that direction
+    // Angle: from current mouse pos to cue ball (we shoot the cue in that direction)
+    const angle = Math.atan2(cueBall.y - currentPos.y, cueBall.x - currentPos.x) + Math.PI;
+    State.aimAngle = angle;
+
+    // Power = distance dragged, normalized
+    if (State.dragStart) {
+      const dist = Math.hypot(currentPos.x - State.dragStart.x, currentPos.y - State.dragStart.y);
+      State.power = Math.min(1, dist / 120);
+      updatePowerBar(State.power);
+    }
+  }
+
+  function shoot() {
+    if (State.vsAI && State.currentPlayer === 1) return;
+    Physics.shootCue(State.aimAngle, State.power);
+    State.shooting = false;
+  }
+
+  function placeCueBall(x, y) {
+    if (!isValidCuePlacement(x, y)) return;
+    const cue = State.balls.find(b => b.id === 0);
+    if (cue) {
+      cue.x = x; cue.y = y;
+      cue.pocketed = false;
+      cue.vx = 0; cue.vy = 0;
+    }
+    State.awaitingCueBall = false;
+    updateStatusMsg("Ball placed. Take your shot!");
+
+    if (State.vsAI && State.currentPlayer === 1) scheduleAIShot();
+  }
+
+  function getMousePos() { return mousePos; }
+
+  return { init, getMousePos };
 })();
 
+/* ══════════════════════════════════════════════════════════════
+   § 10. GAME LOOP
+══════════════════════════════════════════════════════════════ */
+const GameLoop = (() => {
+  let rafId = null;
+  let lastTime = 0;
+  let pocketedAccum = []; // accumulated pocketed balls while rolling
 
-/* ══════════════════════════════════════════════════════
-   § MAIN LOOP & BOOTSTRAP
-══════════════════════════════════════════════════════ */
-(function main() {
-  const canvas = document.getElementById('poolCanvas');
-
-  // ── Resize handler ─────────────────────────────────
-  function resize() {
-    Renderer.resize();
-    if (Game.getState() && Game.getState().table) {
-      Game.resize(canvas);
-    }
+  function start() {
+    if (rafId) cancelAnimationFrame(rafId);
+    lastTime = performance.now();
+    rafId = requestAnimationFrame(tick);
   }
 
+  function stop() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+
+  function tick(now) {
+    rafId = requestAnimationFrame(tick);
+
+    const dt = Math.min((now - lastTime) / 16.67, 3); // cap delta time
+    lastTime = now;
+
+    if (State.screen !== 'game') return;
+
+    // Physics step (skip when awaiting cue placement)
+    const wasMoving = State.ballsMoving;
+
+    if (State.ballsMoving) {
+      const result = Physics.step(State.balls, dt);
+      pocketedAccum.push(...result.pocketedNow);
+
+      if (!Physics.anyMoving(State.balls)) {
+        State.ballsMoving = false;
+        // Evaluate the turn result
+        Rules.evaluate(pocketedAccum);
+        pocketedAccum = [];
+      }
+    } else {
+      // Check if a shot was just fired (velocity present)
+      if (Physics.anyMoving(State.balls)) {
+        State.ballsMoving = true;
+        pocketedAccum = [];
+      }
+    }
+
+    // Update status message
+    if (!State.ballsMoving && !State.awaitingCueBall && !State.aiThinking) {
+      const p = State.currentPlayer === 0 ? 'Player 1' : (State.vsAI ? 'AI' : 'Player 2');
+      updateStatusMsg(`${p}'s turn — aim and shoot!`);
+    }
+
+    // Render
+    Renderer.render(State, State.ballsMoving ? null : Input.getMousePos());
+  }
+
+  return { start, stop };
+})();
+
+/* ══════════════════════════════════════════════════════════════
+   § 11. UI HELPERS
+══════════════════════════════════════════════════════════════ */
+
+function updatePowerBar(power) {
+  const fill = document.getElementById('powerFill');
+  if (fill) fill.style.width = (power * 100) + '%';
+}
+
+function updateTurnUI() {
+  const ti = document.getElementById('turnIndicator');
+  const p1 = document.getElementById('p1Panel');
+  const p2 = document.getElementById('p2Panel');
+  if (!ti) return;
+
+  const isP1 = State.currentPlayer === 0;
+  const name = isP1 ? 'Player 1' : (State.vsAI ? 'AI 🤖' : 'Player 2');
+  ti.textContent = `${name}'s Turn`;
+  ti.classList.toggle('active', true);
+
+  p1.classList.toggle('active', isP1);
+  p2.classList.toggle('active', !isP1);
+}
+
+function updateBallTypeUI() {
+  const p1t = document.getElementById('p1Type');
+  const p2t = document.getElementById('p2Type');
+  if (p1t) p1t.textContent = State.playerTypes[0] ? State.playerTypes[0].toUpperCase() : '—';
+  if (p2t) p2t.textContent = State.playerTypes[1] ? State.playerTypes[1].toUpperCase() : '—';
+  renderHUDBalls();
+}
+
+function renderHUDBalls() {
+  // Show pocketed balls for each player
+  const p1Rack = document.getElementById('p1Balls');
+  const p2Rack = document.getElementById('p2BallsRight');
+  if (!p1Rack || !p2Rack) return;
+
+  function miniBar(containerEl, playerIdx) {
+    containerEl.innerHTML = '';
+    const type = State.playerTypes[playerIdx];
+    if (!type) return;
+    const pocketed = State.balls.filter(b => b.pocketed &&
+      (type === 'solid' ? (b.id >= 1 && b.id <= 7) : (b.id >= 9 && b.id <= 15))
+    );
+    pocketed.forEach(b => {
+      const d = document.createElement('div');
+      d.className = 'mini-ball';
+      d.style.background = BALL_COLORS[b.id];
+      containerEl.appendChild(d);
+    });
+  }
+
+  miniBar(p1Rack, 0);
+  miniBar(p2Rack, 1);
+}
+
+function showFoulMessage(msg) {
+  const el = document.getElementById('foulMsg');
+  if (!el) return;
+  el.textContent = msg;
+  if (msg) setTimeout(() => { el.textContent = ''; }, 3000);
+}
+
+function updateStatusMsg(msg) {
+  const el = document.getElementById('statusMsg');
+  if (el) el.textContent = msg;
+}
+
+function showGameOver(winner, reason) {
+  document.getElementById('winnerText').textContent =
+    `${winner === 0 ? 'Player 1' : (State.vsAI ? 'AI' : 'Player 2')} Wins! 🎱`;
+  document.getElementById('gameOverSub').textContent = reason;
+  setScreen('gameover');
+}
+
+function setScreen(name) {
+  State.screen = name;
+  document.getElementById('startScreen').classList.toggle('active', name === 'start');
+  document.getElementById('gameScreen').classList.toggle('active', name === 'game');
+  document.getElementById('gameOverScreen').classList.toggle('active', name === 'gameover');
+}
+
+function isValidCuePlacement(x, y) {
+  const R = CFG.BALL_R;
+  // Must be within the field
+  if (x - R < FIELD.x || x + R > FIELD.x2) return false;
+  if (y - R < FIELD.y || y + R > FIELD.y2) return false;
+  // Must not overlap other balls
+  return State.balls.every(b => {
+    if (b.pocketed || b.id === 0) return true;
+    return Math.hypot(x - b.x, y - b.y) > R * 2.1;
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════
+   § 12. GAME INITIALIZATION
+══════════════════════════════════════════════════════════════ */
+function initGame(vsAI) {
+  State.vsAI = vsAI;
+  State.balls = rackBalls();
+  State.currentPlayer = 0;
+  State.playerTypes = [null, null];
+  State.typesAssigned = false;
+  State.ballsMoving = false;
+  State.shooting = false;
+  State.awaitingCueBall = false;
+  State.winner = null;
+  State.winReason = '';
+  State.pocketedThisTurn = [];
+  State.pocketFlash = [];
+  State.aiThinking = false;
+  if (State.aiTimer) clearTimeout(State.aiTimer);
+
+  // Update player 2 name
+  document.getElementById('p2Name').textContent = vsAI ? '🤖 AI' : 'Player 2';
+
+  updateTurnUI();
+  updateBallTypeUI();
+  showFoulMessage('');
+  updateStatusMsg('Player 1 breaks!');
+
+  setScreen('game');
+  GameLoop.start();
+  Audio.startBGM();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   § 13. BOOTSTRAP — runs on DOMContentLoaded
+══════════════════════════════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded', () => {
+
+  // Init renderer on canvas
+  const canvas = document.getElementById('poolCanvas');
   Renderer.init(canvas);
   Input.init(canvas);
-  resize();
-  window.addEventListener('resize', resize);
 
-  // ── Sound toggle buttons ───────────────────────────
-  UI.els.soundToggleStart.addEventListener('click', () => {
-    Audio.init();
-    const muted = Audio.toggleMute();
-    UI.updateSoundButton(muted);
-  });
-  UI.els.soundToggleGame.addEventListener('click', () => {
-    const muted = Audio.toggleMute();
-    UI.updateSoundButton(muted);
+  // ── Start Screen buttons ──────────────────────────────────
+  document.getElementById('btn2Player').addEventListener('click', () => initGame(false));
+  document.getElementById('btnVsAI').addEventListener('click',    () => initGame(true));
+
+  document.getElementById('soundToggle').addEventListener('click', function() {
+    const on = Audio.toggleSound();
+    this.textContent = on ? '🔊 Sound ON' : '🔇 Sound OFF';
+    // Trigger AudioContext on user gesture
+    Audio.getCtx();
   });
 
-  // ── Start button ───────────────────────────────────
-  UI.els.startBtn.addEventListener('click', () => {
-    Audio.init();
-    Audio.startMusic();
-    Game.init(canvas);
-    UI.showGame();
+  // ── Game screen buttons ───────────────────────────────────
+  document.getElementById('btnMenu').addEventListener('click', () => {
+    GameLoop.stop();
+    Audio.stopBGM();
+    setScreen('start');
   });
 
-  // ── How to play toggle ─────────────────────────────
-  UI.els.howToBtn.addEventListener('click', () => {
-    UI.els.howtoPanel.classList.toggle('show');
-    UI.els.howToBtn.textContent = UI.els.howtoPanel.classList.contains('show') ? 'HIDE HELP' : 'HOW TO PLAY';
+  document.getElementById('btnSoundGame').addEventListener('click', function() {
+    const on = Audio.toggleSound();
+    this.textContent = on ? '🔊' : '🔇';
   });
 
-  // ── Play again ─────────────────────────────────────
-  UI.els.playAgainBtn.addEventListener('click', () => {
-    Game.init(canvas);
-    UI.showGame();
+  // ── Game Over buttons ─────────────────────────────────────
+  document.getElementById('btnPlayAgain').addEventListener('click', () => initGame(State.vsAI));
+  document.getElementById('btnMainMenu').addEventListener('click', () => {
+    GameLoop.stop();
+    Audio.stopBGM();
+    setScreen('start');
   });
 
-  // ── Main menu ──────────────────────────────────────
-  UI.els.mainMenuBtn.addEventListener('click', () => {
-    UI.showScreen('startScreen');
-    Audio.stopMusic();
-  });
-
-  // ── Show start screen ──────────────────────────────
-  UI.showScreen('startScreen');
-
-  // ── Game Loop ──────────────────────────────────────
-  function loop() {
-    const state = Game.getState();
-
-    if (state) {
-      // Run physics + logic if game is in progress
-      if (!state.gameOver) {
-        Game.update();
-        UI.update(state);
-      }
-
-      // Detect transition to game over (first time)
-      if (state.gameOver && !state._shownOver) {
-        state._shownOver = true;
-        setTimeout(() => UI.showGameOver(state), 900);
-      }
-
-      Renderer.draw(state);
-    } else {
-      // Idle — draw dark background before game starts
-      const ctx2d = canvas.getContext('2d');
-      ctx2d.fillStyle = '#08090c';
-      ctx2d.fillRect(0, 0, canvas.width, canvas.height);
-    }
-
-    requestAnimationFrame(loop);
-  }
-
-  requestAnimationFrame(loop);
-
-})();
+  // Start on the start screen
+  setScreen('start');
+});
