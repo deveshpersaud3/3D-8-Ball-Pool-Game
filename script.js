@@ -97,6 +97,7 @@ const State = {
   power: 0,
   ballsMoving: false,
   awaitingCueBall: false, // scratch — place cue ball
+  ballInHandFull: false,  // true = can place cue ball ANYWHERE on table
 
   // Aiming drag
   dragStart: null,      // { x, y } in canvas coords
@@ -114,6 +115,11 @@ const State = {
 
   // Which balls were pocketed this turn
   pocketedThisTurn: [],
+
+  // Track the first ball the cue ball contacts each shot (for foul detection)
+  // null = no contact yet this shot, 0 = hit cue only (miss), otherwise ball id
+  firstContactId: null,
+  cueHitSomething: false,   // did cue ball touch ANY other ball this shot?
 
   // Win/lose
   winner: null,     // 0 | 1
@@ -440,6 +446,16 @@ const Physics = (() => {
 
     if (dist >= minDist || dist < 0.001) return;
 
+    // Track first contact for foul detection
+    // One of a/b must be the cue ball (id === 0)
+    if (a.id === 0 && !State.cueHitSomething) {
+      State.cueHitSomething = true;
+      State.firstContactId = b.id;
+    } else if (b.id === 0 && !State.cueHitSomething) {
+      State.cueHitSomething = true;
+      State.firstContactId = a.id;
+    }
+
     // Normalize
     const nx = dx / dist;
     const ny = dy / dist;
@@ -472,6 +488,9 @@ const Physics = (() => {
   function shootCue(angle, power) {
     const cue = State.balls.find(b => b.id === 0);
     if (!cue) return;
+    // Reset per-shot contact tracking
+    State.firstContactId = null;
+    State.cueHitSomething = false;
     const force = power * CFG.MAX_POWER;
     cue.vx = Math.cos(angle) * force;
     cue.vy = Math.sin(angle) * force;
@@ -1060,75 +1079,173 @@ const Rules = (() => {
 
     let foul = false;
     let foulReason = '';
-    let switchTurn = true;
+    let switchTurn = true;      // default: turn passes unless player pockets correct ball
+    let ballInHand = false;     // opponent gets to place cue ball anywhere
 
-    const cuePocketed = pocketedThisTurn.some(p => p.ball.id === 0);
+    const cuePocketed   = pocketedThisTurn.some(p => p.ball.id === 0);
     const eightPocketed = pocketedThisTurn.some(p => p.ball.id === 8);
     const otherPocketed = pocketedThisTurn.filter(p => p.ball.id !== 0 && p.ball.id !== 8);
 
-    // ── 8-ball scenarios ───────────────────────────────────────
-    if (eightPocketed) {
-      // Winning: player must have cleared all their balls first
-      const cpBallsRemain = getBallsOnTable(cp);
-      if (cpBallsRemain.length === 0 && !cuePocketed) {
-        // Win!
-        endGame(cp, 'Pocketed the 8-ball correctly! 🎱');
-        return;
-      } else {
-        // Loss: pocketed 8 too early or scratched
-        endGame(op, cuePocketed ? 'Opponent scratched on the 8-ball!' : 'Pocketed 8-ball too early!');
-        return;
-      }
+    // Snapshot first-contact info then clear it for next shot
+    const firstContact     = State.firstContactId;   // id of ball cue hit first, or null
+    const hitAnything      = State.cueHitSomething;
+    State.firstContactId   = null;
+    State.cueHitSomething  = false;
+
+    // ── Determine current player's assigned type ───────────────
+    // (null if not yet assigned — the OPEN TABLE state)
+    const cpType = State.playerTypes[cp]; // 'solid' | 'stripe' | null
+    const opType = State.playerTypes[op];
+
+    // Helper: is a ball id one of cpType's balls?
+    function isCpBall(id) {
+      if (!cpType) return id >= 1 && id <= 15 && id !== 8; // open table: any non-8
+      return cpType === 'solid' ? (id >= 1 && id <= 7) : (id >= 9 && id <= 15);
+    }
+    function isOpBall(id) {
+      if (!opType) return false;
+      return opType === 'solid' ? (id >= 1 && id <= 7) : (id >= 9 && id <= 15);
     }
 
-    // ── Scratch (cue ball pocketed) ────────────────────────────
+    // ── OPEN BREAK: 8-ball pocketed on break → re-rack, no loss ─
+    // On the very first shot (no types assigned yet, rack just broken):
+    if (eightPocketed && !State.typesAssigned && pocketedThisTurn.length >= 1) {
+      // Return 8-ball to table (spot it at foot spot) and continue break rules
+      const eight = pocketedThisTurn.find(p => p.ball.id === 8).ball;
+      eight.pocketed = false;
+      eight.x = FIELD.x + FIELD.w * 0.73;
+      eight.y = FIELD.y + FIELD.h / 2;
+      eight.vx = 0; eight.vy = 0;
+      // Remove 8 from pocketedThisTurn for further evaluation
+      pocketedThisTurn = pocketedThisTurn.filter(p => p.ball.id !== 8);
+      showFoulMessage('8-ball respotted — open table continues');
+      // Fall through to handle any other balls pocketed on the break
+    }
+
+    // ── 8-ball pocketed (not on break) ────────────────────────
+    // Re-check after possible re-spot above
+    const eightNowPocketed = pocketedThisTurn.some(p => p.ball.id === 8);
+    if (eightNowPocketed) {
+      const cpBallsLeft = getBallsOnTable(cp);
+      if (cpBallsLeft.length === 0 && !cuePocketed) {
+        // Legal win — cleared all own balls then pocketed 8
+        endGame(cp, 'Pocketed the 8-ball to win! 🎱');
+      } else {
+        // Loss: pocketed 8 early, or scratched while pocketing 8
+        const reason = cuePocketed
+          ? 'Scratched on the 8-ball — opponent wins!'
+          : 'Pocketed the 8-ball too early — opponent wins!';
+        endGame(op, reason);
+      }
+      return;
+    }
+
+    // ── Foul: cue ball pocketed (scratch) ─────────────────────
     if (cuePocketed) {
       foul = true;
-      foulReason = '⚠ Scratch! Cue ball in pocket.';
-      State.awaitingCueBall = true;
-      // Re-create the cue ball (will be placed by player)
-      const existing = State.balls.find(b => b.id === 0);
-      if (existing) {
-        existing.pocketed = false;
-        existing.x = FIELD.x + FIELD.w * 0.25;
-        existing.y = FIELD.y + FIELD.h / 2;
-        existing.vx = 0; existing.vy = 0;
+      ballInHand = true;
+      foulReason = '⚠ Scratch! Ball in hand for opponent.';
+    }
+
+    // ── Foul: cue ball missed everything ──────────────────────
+    if (!foul && !hitAnything) {
+      foul = true;
+      ballInHand = true;
+      foulReason = '⚠ Foul! Cue ball missed — ball in hand.';
+    }
+
+    // ── Foul: hit the wrong ball first ────────────────────────
+    // On open table: hitting the 8-ball first is a foul (must hit 1-7 or 9-15 first)
+    // Once types are assigned: must hit own type first
+    if (!foul && hitAnything && firstContact !== null) {
+      if (!State.typesAssigned) {
+        // Open table — hitting 8-ball first is a foul
+        if (firstContact === 8) {
+          foul = true;
+          ballInHand = true;
+          foulReason = '⚠ Foul! Hit the 8-ball first on open table — ball in hand.';
+        }
+      } else {
+        // Types assigned — must hit own ball first
+        if (!isCpBall(firstContact) && firstContact !== 8) {
+          foul = true;
+          ballInHand = true;
+          foulReason = `⚠ Foul! Hit opponent's ball first — ball in hand.`;
+        } else if (firstContact === 8 && getBallsOnTable(cp).length > 0) {
+          // Hit 8-ball first when you still have your own balls left
+          foul = true;
+          ballInHand = true;
+          foulReason = '⚠ Foul! Hit the 8-ball first — ball in hand.';
+        }
       }
     }
 
-    // ── Assign ball types on first pocket ──────────────────────
-    if (!State.typesAssigned && otherPocketed.length > 0) {
-      const firstId = otherPocketed[0].ball.id;
-      const cpType = firstId <= 7 ? 'solid' : 'stripe';
-      const opType = cpType === 'solid' ? 'stripe' : 'solid';
-      State.playerTypes[cp] = cpType;
-      State.playerTypes[op] = opType;
+    // ── Foul: pocketed opponent's ball ────────────────────────
+    if (!foul && State.typesAssigned) {
+      const wrongPocketed = otherPocketed.filter(p => isOpBall(p.ball.id));
+      if (wrongPocketed.length > 0) {
+        foul = true;
+        ballInHand = true;
+        foulReason = `⚠ Foul! Pocketed opponent's ball — ball in hand.`;
+        // Opponent's balls stay pocketed in their favor — no respotting needed
+      }
+    }
+
+    // ── Assign ball types on first legal pocket (open table) ──
+    // Only assign if no foul, table is open, and a non-8 ball was pocketed
+    if (!foul && !State.typesAssigned && otherPocketed.length > 0) {
+      const firstId  = otherPocketed[0].ball.id;
+      const cpAssign = firstId <= 7 ? 'solid' : 'stripe';
+      const opAssign = cpAssign === 'solid' ? 'stripe' : 'solid';
+      State.playerTypes[cp] = cpAssign;
+      State.playerTypes[op] = opAssign;
       State.typesAssigned = true;
       updateBallTypeUI();
     }
 
-    // ── Check if pocketed correct balls ───────────────────────
-    if (!foul && State.typesAssigned && otherPocketed.length > 0) {
-      const cpType = State.playerTypes[cp];
-      const correctPocketed = otherPocketed.filter(p => {
-        return cpType === 'solid' ? p.ball.id >= 1 && p.ball.id <= 7
-                                  : p.ball.id >= 9 && p.ball.id <= 15;
-      });
-      if (correctPocketed.length > 0 && !foul) {
-        switchTurn = false; // Extra turn for pocketing correct balls
+    // ── Continue turn if pocketed correct ball (no foul) ──────
+    if (!foul && !cuePocketed && State.typesAssigned && otherPocketed.length > 0) {
+      const correctCount = otherPocketed.filter(p => isCpBall(p.ball.id)).length;
+      if (correctCount > 0) {
+        switchTurn = false; // player gets to shoot again
       }
     }
 
-    // Switch turns or continue
-    if (foul || switchTurn) {
+    // ── On open table, pocketing any ball (no foul) = continue turn
+    if (!foul && !cuePocketed && !State.typesAssigned && otherPocketed.length > 0) {
+      switchTurn = false;
+    }
+
+    // ── Apply foul / turn switch ───────────────────────────────
+    if (foul) {
+      switchTurn = true; // always switch on foul
+    }
+
+    if (switchTurn) {
       State.currentPlayer = op;
     }
 
-    showFoulMessage(foulReason);
+    // ── Ball in hand: opponent places cue ball anywhere ────────
+    if (foul && ballInHand) {
+      State.awaitingCueBall = true;
+      State.ballInHandFull  = true;  // can place anywhere (not just behind head string)
+      // Restore cue ball to table if it was pocketed
+      const cueBall = State.balls.find(b => b.id === 0);
+      if (cueBall && cueBall.pocketed) {
+        cueBall.pocketed = false;
+        cueBall.x = FIELD.x + FIELD.w * 0.25;
+        cueBall.y = FIELD.y + FIELD.h / 2;
+        cueBall.vx = 0; cueBall.vy = 0;
+      }
+      updateStatusMsg(`Ball in hand! ${switchTurn ? (State.vsAI && State.currentPlayer === 1 ? 'AI' : `Player ${State.currentPlayer + 1}`) : `Player ${cp + 1}`} — click anywhere to place cue ball.`);
+    }
+
+    showFoulMessage(foul ? foulReason : '');
     updateTurnUI();
+    updateHUDBallsDisplay();
     State.pocketedThisTurn = [];
 
-    // Trigger AI if it's AI's turn
+    // Trigger AI if it's now AI's turn
     if (State.vsAI && State.currentPlayer === 1 && !State.awaitingCueBall) {
       scheduleAIShot();
     }
@@ -1167,9 +1284,53 @@ const AI = (() => {
     updateStatusMsg('🤖 AI is thinking...');
 
     State.aiTimer = setTimeout(() => {
+      // If AI has ball in hand, place it at a sensible position first
+      if (State.awaitingCueBall) {
+        placeAICueBall();
+        State.aiThinking = false;
+        // Now schedule the actual shot
+        State.aiTimer = setTimeout(() => {
+          State.aiThinking = true;
+          takeShot();
+          State.aiThinking = false;
+        }, 600);
+        return;
+      }
       takeShot();
       State.aiThinking = false;
     }, CFG.AI_THINK_MS + Math.random() * 400);
+  }
+
+  /** AI places the cue ball at a reasonable spot when it has ball-in-hand */
+  function placeAICueBall() {
+    // Try a few candidate positions and pick one that's valid and near a target
+    const candidates = [
+      { x: FIELD.x + FIELD.w * 0.22, y: FIELD.y + FIELD.h * 0.5 },
+      { x: FIELD.x + FIELD.w * 0.22, y: FIELD.y + FIELD.h * 0.3 },
+      { x: FIELD.x + FIELD.w * 0.22, y: FIELD.y + FIELD.h * 0.7 },
+      { x: FIELD.x + FIELD.w * 0.3,  y: FIELD.y + FIELD.h * 0.5 },
+    ];
+    for (const c of candidates) {
+      if (isValidCuePlacement(c.x, c.y)) {
+        const cue = State.balls.find(b => b.id === 0);
+        if (cue) { cue.x = c.x; cue.y = c.y; cue.pocketed = false; cue.vx = 0; cue.vy = 0; }
+        State.awaitingCueBall = false;
+        State.ballInHandFull  = false;
+        return;
+      }
+    }
+    // Fallback: find any valid position
+    for (let tries = 0; tries < 50; tries++) {
+      const x = FIELD.x + 20 + Math.random() * (FIELD.w - 40);
+      const y = FIELD.y + 20 + Math.random() * (FIELD.h - 40);
+      if (isValidCuePlacement(x, y)) {
+        const cue = State.balls.find(b => b.id === 0);
+        if (cue) { cue.x = x; cue.y = y; cue.pocketed = false; cue.vx = 0; cue.vy = 0; }
+        State.awaitingCueBall = false;
+        State.ballInHandFull  = false;
+        return;
+      }
+    }
   }
 
   function takeShot() {
@@ -1376,7 +1537,9 @@ const Input = (() => {
       cue.vx = 0; cue.vy = 0;
     }
     State.awaitingCueBall = false;
-    updateStatusMsg("Ball placed. Take your shot!");
+    State.ballInHandFull  = false;
+    const pName = State.currentPlayer === 0 ? 'Player 1' : (State.vsAI ? 'AI' : 'Player 2');
+    updateStatusMsg(`${pName}'s turn — ball placed, take your shot!`);
 
     if (State.vsAI && State.currentPlayer === 1) scheduleAIShot();
   }
@@ -1504,6 +1667,9 @@ function renderHUDBalls() {
   miniBar(p2Rack, 1);
 }
 
+// Alias used by Rules engine
+function updateHUDBallsDisplay() { renderHUDBalls(); }
+
 function showFoulMessage(msg) {
   const el = document.getElementById('foulMsg');
   if (!el) return;
@@ -1532,13 +1698,13 @@ function setScreen(name) {
 
 function isValidCuePlacement(x, y) {
   const R = CFG.BALL_R;
-  // Must be within the field
+  // Must be within the playfield (inside the cushions)
   if (x - R < FIELD.x || x + R > FIELD.x2) return false;
   if (y - R < FIELD.y || y + R > FIELD.y2) return false;
-  // Must not overlap other balls
+  // Must not overlap any other live ball
   return State.balls.every(b => {
     if (b.pocketed || b.id === 0) return true;
-    return Math.hypot(x - b.x, y - b.y) > R * 2.1;
+    return Math.hypot(x - b.x, y - b.y) > R * 2.2;
   });
 }
 
@@ -1554,11 +1720,14 @@ function initGame(vsAI) {
   State.ballsMoving = false;
   State.shooting = false;
   State.awaitingCueBall = false;
+  State.ballInHandFull = false;
   State.winner = null;
   State.winReason = '';
   State.pocketedThisTurn = [];
   State.pocketFlash = [];
   State.aiThinking = false;
+  State.firstContactId = null;
+  State.cueHitSomething = false;
   if (State.aiTimer) clearTimeout(State.aiTimer);
 
   // Update player 2 name
