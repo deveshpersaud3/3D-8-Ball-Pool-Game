@@ -25,7 +25,7 @@ const CFG = {
   AI_ACCURACY:  0.94,      // 0–1, how accurate the aim is
   // Rendering
   GUIDE_DOTS:   14,        // number of aim guide dots
-  GUIDE_LEN:    220,       // length of aim guideline
+  GUIDE_LEN:    320,       // length of aim guideline
   CUE_LEN:      200,       // cue stick draw length on screen
 };
 
