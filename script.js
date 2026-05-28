@@ -848,25 +848,33 @@ const Renderer = (() => {
       if (t > 0 && t < hitDist) hitDist = t;
     });
 
-    // Draw dashed line
+    // Draw dashed aim line
     const endX = cueBall.x + dx * hitDist;
     const endY = cueBall.y + dy * hitDist;
 
     c.save();
-    c.globalAlpha = 0.55;
-    c.strokeStyle = '#d4af37';
+    c.globalAlpha = 0.85;
+    c.strokeStyle = 'rgba(249,213,114,0.95)';
+    c.lineWidth = 3;
+    c.setLineDash([8, 10]);
+    c.beginPath();
+    c.moveTo(cueBall.x, cueBall.y);
+    c.lineTo(endX, endY);
+    c.stroke();
+
+    c.strokeStyle = 'rgba(249,213,114,0.55)';
     c.lineWidth = 1.5;
-    c.setLineDash([6, 8]);
+    c.setLineDash([2, 6]);
     c.beginPath();
     c.moveTo(cueBall.x, cueBall.y);
     c.lineTo(endX, endY);
     c.stroke();
 
     // Ghost cue ball at impact point
-    c.globalAlpha = 0.25;
+    c.globalAlpha = 0.5;
     c.setLineDash([]);
-    c.strokeStyle = '#fff';
-    c.lineWidth = 1;
+    c.strokeStyle = 'rgba(255,255,255,0.9)';
+    c.lineWidth = 2;
     c.beginPath();
     c.arc(endX, endY, R, 0, Math.PI * 2);
     c.stroke();
